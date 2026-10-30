@@ -423,6 +423,7 @@ TEXTS = {
            "nothing": "aucun objet à dessiner", "noview": "aucune vue choisie", "nothing_on": "aucun objet à dessiner sur la feuille « {s} »",
            "hidden_skip": "traits cachés non calculés : {n} triangles, trop pour un plan lisible (isole les pièces voulues)",
            "hidden_trim": "{v} : traits cachés simplifiés ({cut} petits traits retirés, {kept} gardés)",
+           "hidden_trim_all": "traits cachés simplifiés sur {n} vue{s} : petits traits retirés pour la lisibilité",
            "view_done": "{v} : {n} points en {t:.1f} s",
            "views": {"Face": "face", "Gauche": "gauche", "Droite": "droite", "Dessus": "dessus", "Perspective": "perspective"}},
     "en": {"Face": "FRONT VIEW", "Gauche": "LEFT VIEW", "Droite": "RIGHT VIEW", "Dessus": "TOP VIEW",
@@ -438,6 +439,7 @@ TEXTS = {
            "nothing": "nothing to draw", "noview": "no view selected", "nothing_on": "nothing to draw on sheet “{s}”",
            "hidden_skip": "hidden lines skipped: {n} triangles, too many for a readable drawing (isolate the parts you need)",
            "hidden_trim": "{v}: hidden lines simplified ({cut} small strokes removed, {kept} kept)",
+           "hidden_trim_all": "Hidden lines simplified on {n} view{s}: small strokes removed for readability",
            "view_done": "{v}: {n} points in {t:.1f} s",
            "views": {"Face": "front", "Gauche": "left", "Droite": "right", "Dessus": "top", "Perspective": "isometric"}}}
 
@@ -752,6 +754,7 @@ def run(SPEC, OUT, progress=None):
     LB = SPEC.get("labels") or {}
     gmode = GR.get("mode") if GR.get("mode") in ("ruler", "grid") and GR.get("views") else None
     gtop = RULER if gmode else 0
+    infos = []
     warnings = []
     tell0 = progress or (lambda f, msg: None)
     gi = [0, 1]
@@ -810,7 +813,7 @@ def run(SPEC, OUT, progress=None):
                               (ex[1] - ex[0]) / max(ex[3] - ex[2], 1e-9) if ex else None, SPEC.get("sheet") or "A3", SPEC.get("land", True),
                               SPEC.get("scale"), planlayout.IMPERIAL if unit == "in" else planlayout.SCALES, lang, rows,
                               XT["inside"] + XT["above"] + bom_height(bom), gtop, gtop, third)
-        drawn, trimmed = {}, False
+        drawn, trimmed = {}, 0
         steps = [f"{label + ' : ' if label else ''}" + TX["hidden_skip"].format(n=format(tris, ",").replace(",", " " if lang == "fr" else ","))] if skip_hidden else []
         warnings.extend(steps)
         for name, d, up in VIEWS:
@@ -823,9 +826,8 @@ def run(SPEC, OUT, progress=None):
             n_hidden = sum(len(x) for x in S.get("cache", []))
             if n_hidden > HIDDEN_MAX:
                 S["cache"], cut = trim_hidden(S["cache"], HIDDEN_MAX, ext)
-                trimmed = True
                 steps.append(f"{label + ' · ' if label else ''}" + TX["hidden_trim"].format(v=TX["views"][name], cut=cut, kept=len(S["cache"])))
-                warnings.append(steps[-1])
+                trimmed += 1
             drawn[name] = {"contour": S.get("contour", []), "detail": S.get("detail", []), "cache": S.get("cache", []), "ext": ext,
                            "axes": view_axes(cam), "chains": [chain_info(cam, chain_positions(cam, co, ref), rel, pos, unit_mm)
                                       for vn, co, ref, rel, pos in chains if vn == name],
@@ -834,6 +836,8 @@ def run(SPEC, OUT, progress=None):
             bpy.data.objects.remove(gp)
             bpy.data.objects.remove(cam)
             steps.append(f"{label + ' · ' if label else ''}" + TX["view_done"].format(v=TX["views"][name], n=sum(len(x) for k in ("contour", "detail") for x in S.get(k, [])), t=time.time() - t))
+        if trimmed:
+            infos.append(f"{label + ' : ' if label else ''}" + TX["hidden_trim_all"].format(n=trimmed, s="s" if trimmed > 1 else ""))
         return {"label": label, "drawn": drawn, "scale": L["scale"], "pages": L["pages"], "note": L["note"], "real": real, "lo": lo, "hi": hi,
                 "hidden": hidden and any(d["cache"] for d in drawn.values()), "trimmed": trimmed, "steps": steps, "objects": len(objs), "unit_mm": unit_mm, "bom": bom}
 
@@ -1169,7 +1173,7 @@ def run(SPEC, OUT, progress=None):
     with open(os.path.join(OUT, "out", f"{name}.pdf"), "wb") as f:
         f.write(pdf(sheets))
     files = [f"{name}.pdf"] + svgs
-    return {"files": files, "sizes": {fn: os.path.getsize(os.path.join(OUT, "out", fn)) for fn in files}, "steps": steps, "warnings": warnings,
+    return {"files": files, "sizes": {fn: os.path.getsize(os.path.join(OUT, "out", fn)) for fn in files}, "steps": steps, "warnings": warnings, "infos": infos,
             "scale": G[0]["scale"], "size_mm": [round(v, 1) for v in G[0]["real"]], "objects": sum(g["objects"] for g in G),
             "seconds": round(time.time() - t0, 1),
             "pages": [{"svg": fn, "views": [v["name"] for v in pg["views"]], "land": pg["land"], "sheet": g["label"], "scale": g["scale"]}

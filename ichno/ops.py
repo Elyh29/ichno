@@ -206,6 +206,8 @@ class ICHNO_OT_make(bpy.types.Operator):
             return self.finish(context, res["error"])
         for st in res.get("warnings", []):
             self.report({"WARNING"}, st)
+        for st in res.get("infos", []):
+            self.report({"INFO"}, st)
         context.window_manager.ichno_job.last = res["pdf"]
         if _job["open"]:
             bpy.ops.wm.path_open(filepath=res["pdf"])

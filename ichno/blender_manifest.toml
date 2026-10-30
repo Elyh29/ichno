@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "ichno"
-version = "1.0.2"
+version = "1.0.3"
 name = "Ichno"
 tagline = "One-click technical drawings (PDF, SVG) from your 3D scene"
 maintainer = "Ely"
