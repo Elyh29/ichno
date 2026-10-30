@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import sys
@@ -12,8 +13,13 @@ def progress(frac, msg):
 
 
 try:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import planengine
+    def load(name, **given):
+        spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        mod.__dict__.update(given)
+        spec.loader.exec_module(mod)
+        return mod
+    planengine = load("planengine", planlayout=load("planlayout"))
     with open(argv[1], encoding="utf-8") as f:
         SPEC = json.load(f)
     res = {"ok": True, **planengine.run(SPEC, OUT, progress)}

@@ -5,10 +5,11 @@ import time
 import bpy
 from mathutils import Matrix, Vector
 
-try:
-    from . import planlayout
-except ImportError:
-    import planlayout
+if "planlayout" not in globals():
+    try:
+        from . import planlayout
+    except ImportError:
+        import planlayout
 GEOMETRY = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
 WEIGHTS = {"fine": {"contour": 0.25, "detail": 0.09, "cache": 0.07}, "normal": {"contour": 0.35, "detail": 0.13, "cache": 0.1},
            "bold": {"contour": 0.5, "detail": 0.25, "cache": 0.18}}

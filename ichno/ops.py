@@ -1,13 +1,10 @@
 import datetime
 import json
-import collections
 import os
-import queue
 import shutil
 import subprocess
 import tempfile
 import sys
-import threading
 
 from mathutils import Vector
 
@@ -35,13 +32,19 @@ def redraw():
                 a.tag_redraw()
 
 
-def reader(proc, lines, log):
-    for line in proc.stdout:
+def read_output(job):
+    with open(_job["out"], encoding="utf-8", errors="replace") as f:
+        f.seek(_job["pos"])
+        chunk = f.read()
+    end = chunk.rfind("\n") + 1
+    _job["pos"] += len(chunk[:end].encode("utf-8", errors="replace"))
+    for line in chunk[:end].splitlines():
         if line.startswith("PLAN_PROGRESS\t"):
-            _, f, msg = line.rstrip("\n").split("\t", 2)
-            lines.put((float(f), msg))
+            _, f, msg = line.split("\t", 2)
+            job.progress, job.message = float(f), msg
         else:
-            log.append(line.rstrip("\n"))
+            _job["log"].append(line)
+    del _job["log"][:-400]
 
 
 def save_log(res):
@@ -106,10 +109,10 @@ def start(context):
         json.dump(spec, f, ensure_ascii=False)
     cmd = [bpy.app.binary_path, "-b", blend, "--factory-startup", "--disable-autoexec", "-noaudio",
            "--python", os.path.join(HERE, "runner.py"), "--", tmp, os.path.join(tmp, "spec.json")]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    lines, log = queue.Queue(), collections.deque(maxlen=400)
-    threading.Thread(target=reader, args=(proc, lines, log), daemon=True).start()
-    _job.update(proc=proc, tmp=tmp, lines=lines, log=log, cancel=False, folder=output_folder(s), open=s.open_pdf)
+    out = os.path.join(tmp, "output.txt")
+    with open(out, "wb") as f:
+        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+    _job.update(proc=proc, tmp=tmp, out=out, pos=0, log=[], cancel=False, folder=output_folder(s), open=s.open_pdf)
     job.running, job.progress, job.message = True, 0, tr("Starting…")
     return None
 
@@ -186,14 +189,14 @@ class ICHNO_OT_make(bpy.types.Operator):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         job = context.window_manager.ichno_job
-        while not _job["lines"].empty():
-            job.progress, job.message = _job["lines"].get()
+        read_output(job)
         if _job["cancel"]:
             _job["proc"].kill()
             return self.finish(context, tr("Cancelled"))
         if _job["proc"].poll() is None:
             redraw()
             return {"PASS_THROUGH"}
+        read_output(job)
         try:
             res = collect()
         except Exception as e:
