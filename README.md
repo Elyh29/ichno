@@ -56,8 +56,8 @@ The drawing is computed by a second Blender in the background, from a copy of yo
 
 | | |
 |---|---|
-| ![Front, side, top and isometric views on an A3 sheet](images/p1.png) | ![Overall and chain dimensions with equal spacing combined](images/p2.png) |
-| ![Title block with revisions, custom fields, legend and bill of materials](images/p3.png) | ![Isometric view chosen from any corner of the model](images/p4.png) |
+| ![Front, side, top and isometric views on an A3 sheet](images/free2.png) | ![Overall and chain dimensions with equal spacing combined](images/free3.png) |
+| ![Title block with revisions, custom fields, legend and bill of materials](images/free4.png) | ![Isometric view chosen from any corner of the model](images/free5.png) |
 
 ## FAQ
 **Can I open the drawing in AutoCAD or another CAD tool?**
