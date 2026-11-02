@@ -1,0 +1,36 @@
+name: Bug report
+description: Something is wrong in a drawing or in the add-on
+labels: [bug]
+body:
+  - type: input
+    id: blender
+    attributes:
+      label: Blender version and OS
+      placeholder: e.g. Blender 5.0.1, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: ichno
+    attributes:
+      label: Ichno version
+      placeholder: e.g. 1.0.5
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, what you got. Screenshots of the drawing help a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Open the attached .blend\n2. Ichno tab ‣ Make Plan\n3. ..."
+  - type: textarea
+    id: log
+    attributes:
+      label: ichno-log.txt
+      description: If the drawing failed, paste the content of ichno-log.txt (written in the drawing folder).
+      render: text
