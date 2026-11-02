@@ -5,7 +5,7 @@ Orthographic views, isometric view, dimensions, title block and bill of material
 
 *Featured on [BlenderNation](https://www.blendernation.com/2026/11/01/ichno-free-one-click-technical-drawings-from-blender-scenes/).*
 
-![Ichno: a Blender model turned into a dimensioned technical drawing with front, side, top and isometric views](images/featured.png)
+![Ichno: a Blender model turned into a dimensioned technical drawing with front, side, top and isometric views](images/free1.png)
 
 Ichno makes **blueprints and shop drawings** straight from Blender: furniture and woodworking plans, interior layouts,
 product and 3D printing parts, mechanical assemblies. The drawings are ready to print, to send to a client or a workshop,
