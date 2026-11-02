@@ -1,0 +1,21 @@
+name: Feature request
+description: An idea for a better drawing
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What drawing do you need?
+      description: Describe the result. A sketch or an example from a real drawing is perfect.
+    validations:
+      required: true
+  - type: input
+    id: standard
+    attributes:
+      label: Related standard (if any)
+      placeholder: e.g. ISO 129-1, ASME Y14.5
+  - type: textarea
+    id: context
+    attributes:
+      label: What do you use Ichno for?
+      placeholder: e.g. furniture plans for a workshop
