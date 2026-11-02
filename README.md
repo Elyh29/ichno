@@ -59,6 +59,20 @@ The drawing is computed by a second Blender in the background, from a copy of yo
 | ![Front, side, top and isometric views on an A3 sheet](images/free2.png) | ![Overall and chain dimensions with equal spacing combined](images/free3.png) |
 | ![Title block with revisions, custom fields, legend and bill of materials](images/free4.png) | ![Isometric view chosen from any corner of the model](images/free5.png) |
 
+## Roadmap
+A new version every two weeks. Target dates, they may change.
+
+![Ichno roadmap: 1.0.6 on Nov 8, 1.0.7 on Nov 22, 1.0.8 on Dec 6, 1.0.9 Japan on Dec 20, more countries in 2027](images/roadmap.png)
+
+- **1.0.6 (Nov 8)**: ISO 2768 general tolerances with a table of deviations, ISO small dimensions, F1 help, SVG layers
+- **1.0.7 (Nov 22)**: manual and angle dimensions, notes with leaders, dimension styles
+- **1.0.8 (Dec 6)**: centre lines, hole dimensions and spacing
+- **1.0.9 (Dec 20)**: country setting, first national update for Japan (JIS standard, Japanese interface and drawings)
+- **2027**: more countries (DIN, GB/T, ASME Y14.1, Spanish, Portuguese) and more languages
+
+Missing something for your drawings? Open a [feature request](../../issues/new/choose).
+
+
 ## FAQ
 **Can I open the drawing in AutoCAD or another CAD tool?**
 Yes, through the SVG or PDF export (most CAD tools import one of them).
