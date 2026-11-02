@@ -3,6 +3,8 @@
 **Free Blender add-on: turn your 3D scene into a technical drawing in one click.**
 Orthographic views, isometric view, dimensions, title block and bill of materials, exported as vector **PDF** and **SVG**.
 
+*Featured on [BlenderNation](https://www.blendernation.com/2026/11/01/ichno-free-one-click-technical-drawings-from-blender-scenes/).*
+
 ![Ichno: a Blender model turned into a dimensioned technical drawing with front, side, top and isometric views](images/featured.png)
 
 Ichno makes **blueprints and shop drawings** straight from Blender: furniture and woodworking plans, interior layouts,
@@ -32,7 +34,8 @@ The drawing is computed by a second Blender in the background, from a copy of yo
 - Automatic standard scale (metric or imperial), or a fixed one
 
 ### Dimensions
-- Overall dimensions on every view, in mm, cm, m or inches
+- **ISO or ASME** dimensioning: text placement, arrowheads and extension lines follow each standard
+- Overall dimensions, each shown once (width and height on the front view, depth on the side view), in mm, cm, m or inches
 - Dual dimensioning, e.g. `254.0 [10.00"]`
 - Chain dimensions for rows of objects, equal spacing combined as `5 × 600 = 3000`
 - Coordinate ruler or architect grid (A, B, C / 1, 2, 3)
@@ -41,7 +44,9 @@ The drawing is computed by a second Blender in the background, from a copy of yo
 - A4 to A0, Letter, Tabloid, ANSI C and D, portrait or landscape
 - **One sheet per collection** in a single multi-page PDF, each with its own views and scale
 - Title block with company name and logo, drawing number, author, date, revision table, custom fields
-- **Bill of materials (BOM)** counted by object name, collection or custom property
+- Checked, Approved, **general tolerances** (ISO 2768, ISO 22081 or custom) and material
+- ISO 128 line weights, ISO 5457 border with optional filing margin, ISO 3098 text heights
+- **Bill of materials (BOM)** counted by object name, collection or custom property, on the drawing or on a separate sheet
 - Abbreviation legend, remarks and ownership notice
 
 ### Practical
