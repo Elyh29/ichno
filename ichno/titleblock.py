@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ichno: title block lists (revisions, custom fields, legend)
 import datetime
 
 import bpy

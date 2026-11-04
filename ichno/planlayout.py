@@ -1,13 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ichno: sheet layout and scales
 SHEETS = {"A4": (297, 210), "A3": (420, 297), "A2": (594, 420), "A1": (841, 594), "A0": (1189, 841),
           "Letter": (279.4, 215.9), "Tabloid": (431.8, 279.4), "ANSI C": (558.8, 431.8), "ANSI D": (863.6, 558.8)}
 SCALES = [10, 5, 2, 1, 1 / 2, 1 / 5, 1 / 10, 1 / 20, 1 / 50, 1 / 100, 1 / 200, 1 / 500]
 IMPERIAL = [4, 2, 1, 1 / 2, 1 / 4, 1 / 8, 1 / 12, 1 / 16, 1 / 24, 1 / 48, 1 / 96, 1 / 192, 1 / 384]
 MARGIN = 10
+MARGIN_L = 10
 INSET = 5
 BAND = 17
 TB_W, TB_H = 180, 36
 NOTES = 11
-TOP, BOTTOM, RIGHT = 11, 11, 12
+TOP, BOTTOM, RIGHT = 11, 13, 13
 THIRD = None
 LEFT = 0
 GAPS = (22, 16, 11, 7)
@@ -30,7 +33,7 @@ def sheet_size(sheet, land):
 
 
 def zones(sw, sh):
-    area = (MARGIN + INSET, MARGIN + BAND, sw - MARGIN - INSET, sh - MARGIN - INSET)
+    area = (MARGIN_L + INSET, MARGIN + BAND, sw - MARGIN - INSET, sh - MARGIN - INSET)
     keep = (sw - MARGIN - min(TB_W, sw - 2 * MARGIN) - INSET, sh - MARGIN - TB_H - NOTES)
     return area, keep
 
@@ -170,10 +173,10 @@ def label(s):
 
 
 def layout(dims, aspect, sheet="A3", land=True, scale="auto", scales=SCALES, lang="fr", extra_bottom=0, extra_tb=0, extra_top=0, extra_left=0,
-           third=None):
-    global BOTTOM, NOTES, TOP, LEFT, THIRD
-    saved = BOTTOM, NOTES, TOP, LEFT, THIRD
-    BOTTOM, NOTES, TOP, LEFT, THIRD = BOTTOM + extra_bottom, NOTES + extra_tb, TOP + extra_top, LEFT + extra_left, third
+           third=None, extra_right=0):
+    global BOTTOM, NOTES, TOP, LEFT, THIRD, RIGHT
+    saved = BOTTOM, NOTES, TOP, LEFT, THIRD, RIGHT
+    BOTTOM, NOTES, TOP, LEFT, THIRD, RIGHT = BOTTOM + extra_bottom, NOTES + extra_tb, TOP + extra_top, LEFT + extra_left, third, RIGHT + extra_right
     try:
         if not dims:
             p = alone("Perspective", aspect, 1, sheet, land, True) if aspect else None
@@ -182,7 +185,7 @@ def layout(dims, aspect, sheet="A3", land=True, scale="auto", scales=SCALES, lan
             return {"scale": 1, "pages": [p], "note": ""}
         return _layout(dims, aspect, sheet, land, scale, scales, lang)
     finally:
-        BOTTOM, NOTES, TOP, LEFT, THIRD = saved
+        BOTTOM, NOTES, TOP, LEFT, THIRD, RIGHT = saved
 
 
 def _layout(dims, aspect, sheet, land, scale, scales, lang):

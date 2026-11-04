@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ichno: drawing engine (views, dimensions, title block, PDF and SVG)
 import math
 import os
+import random
+import re
 import time
 
 import bpy
@@ -11,9 +15,12 @@ if "planlayout" not in globals():
     except ImportError:
         import planlayout
 GEOMETRY = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
-WEIGHTS = {"fine": {"contour": 0.25, "detail": 0.09, "cache": 0.07}, "normal": {"contour": 0.35, "detail": 0.13, "cache": 0.1},
-           "bold": {"contour": 0.5, "detail": 0.25, "cache": 0.18}}
+WEIGHTS = {"fine": {"contour": 0.25, "detail": 0.13, "cache": 0.13}, "normal": {"contour": 0.35, "detail": 0.18, "cache": 0.18},
+           "bold": {"contour": 0.5, "detail": 0.25, "cache": 0.25}}
+ASME, DT, D1, EXT_GAP, EXT_OVER, TICKS = False, 3.5, 10, 0, 2, False
+ARROW = [3.0, math.radians(15)]
 HIDDEN_TRIS = 1_500_000
+EXTRA_OUTPUTS = []
 HIDDEN_MAX = 150_000
 FRONTS = {"front": ((1, 0, 0), (0, 1, 0), (0, 0, 1)), "back": ((-1, 0, 0), (0, -1, 0), (0, 0, 1)),
           "right": ((0, 1, 0), (-1, 0, 0), (0, 0, 1)), "left": ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
@@ -225,64 +232,116 @@ def strokes_2d(gp, cam):
 class Sheet:
     def __init__(self, w, h):
         self.w, self.h, self.items = w, h, []
+        self.bom, self.bom_head = [], ()
+        self.scale = None
+        self.layer, self.layers = "FRAME", []
+        self.style = ""
+
+    def colors(self):
+        if self.style == "blueprint":
+            return (0.12, 0.30, 0.55), (0.96, 0.98, 1), (0.72, 0.82, 0.94), (0.24, 0.42, 0.66)
+        if self.style == "sketch":
+            return (0.99, 0.98, 0.95), (0.18, 0.18, 0.2), (0.45, 0.45, 0.48), None
+        return (1, 1, 1), (0.067, 0.067, 0.067), (0.4, 0.4, 0.4), None
+
+    def sketch(self, pts, closed, k=0):
+        rnd = random.Random(round(pts[0][0] * 37 + pts[0][1] * 101 + len(pts)) + k * 7919)
+        dx, dy = rnd.uniform(-0.4, 0.4), rnd.uniform(-0.4, 0.4)
+        q = [(x + dx, y + dy) for x, y in pts]
+        if not closed and len(q) >= 2:
+            for i, j in ((0, 1), (-1, -2)):
+                (ax, ay), (bx, by) = q[i], q[j]
+                d = math.hypot(ax - bx, ay - by)
+                if d > 2:
+                    o = rnd.uniform(1, 2.5) / d
+                    q[i] = (ax + (ax - bx) * o, ay + (ay - by) * o)
+        return q
+
+    def add(self, it):
+        self.items.append(it)
+        self.layers.append(self.layer)
 
     def poly(self, pts, lw=0.35, dash=None, closed=False):
-        self.items.append(("poly", pts, lw, dash, closed))
+        self.add(("poly", pts, lw, dash, closed))
 
     def image(self, x, y, w, h, img):
         k = min(w / img["w"], h / img["h"])
-        self.items.append(("image", x + (w - img["w"] * k) / 2, y + (h - img["h"] * k) / 2, img["w"] * k, img["h"] * k, img))
+        self.add(("image", x + (w - img["w"] * k) / 2, y + (h - img["h"] * k) / 2, img["w"] * k, img["h"] * k, img))
 
     def line(self, x1, y1, x2, y2, lw=0.18):
         self.poly([(x1, y1), (x2, y2)], lw)
 
     def tri(self, pts):
-        self.items.append(("tri", pts))
+        self.add(("tri", pts))
 
     def blank(self, x, y, w, h):
-        self.items.append(("blank", x, y, w, h))
+        self.add(("blank", x, y, w, h))
 
     def text(self, x, y, s, size, align="left", bold=False, grey=False, rot=False):
-        self.items.append(("text", x, y, s, size, align, bold, grey, rot))
+        self.add(("text", x, y, s, size, align, bold, grey, rot))
 
-    def arrow(self, x1, y1, x2, y2):
-        self.line(x1, y1, x2, y2)
-        a, L, s2 = math.atan2(y2 - y1, x2 - x1), 2.4, 0.45
+    def arrow(self, x1, y1, x2, y2, gap=0, out=False):
+        L, s2 = ARROW
+        a, d = math.atan2(y2 - y1, x2 - x1), math.hypot(x2 - x1, y2 - y1)
+        if out and d:
+            ux, uy = (x2 - x1) / d * (L + 2), (y2 - y1) / d * (L + 2)
+            self.line(x1 - ux, y1 - uy, x2 + ux, y2 + uy)
+            a += math.pi
+        elif gap and d > gap + 2 * L:
+            f = (d - gap) / 2 / d
+            self.line(x1, y1, x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)
+            self.line(x2 - (x2 - x1) * f, y2 - (y2 - y1) * f, x2, y2)
+        else:
+            self.line(x1, y1, x2, y2)
         for px, py, aa in ((x1, y1, a), (x2, y2, a + math.pi)):
             self.tri([(px, py), (px + L * math.cos(aa - s2), py + L * math.sin(aa - s2)), (px + L * math.cos(aa + s2), py + L * math.sin(aa + s2))])
 
     def svg(self):
         esc = lambda s: s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        hexa = lambda c: "#%02x%02x%02x" % tuple(round(v * 255) for v in c)
+        paper, ink, grey_c, grid = (hexa(c) if c else None for c in self.colors())
+        lay = self.layers if len(self.layers) == len(self.items) else [""] * len(self.items)
+        cls = lambda i, text=False: (f' class="{"TEXT" if text and lay[i] != "DIMENSIONS" else lay[i]}"' if lay[i] else "")
         out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.w}mm" height="{self.h}mm" viewBox="0 0 {self.w} {self.h}">',
-               f'<rect width="{self.w}" height="{self.h}" fill="#fff"/><g fill="none" stroke="#111" stroke-linecap="round" stroke-linejoin="round">']
-        for it in self.items:
+               f'<rect width="{self.w}" height="{self.h}" fill="{paper}"/>']
+        if grid:
+            out.append(f'<g stroke="{grid}" stroke-width="0.1">' + "".join(f'<path d="M{x} 0 V{self.h}"/>' for x in range(10, int(self.w), 10))
+                       + "".join(f'<path d="M0 {y} H{self.w}"/>' for y in range(10, int(self.h), 10)) + "</g>")
+        out.append(f'<g fill="none" stroke="{ink}" stroke-linecap="round" stroke-linejoin="round">')
+        for i, it in enumerate(self.items):
             if it[0] == "poly":
                 _, pts, lw, dash, closed = it
+                if self.style == "sketch":
+                    if lw >= 0.3:
+                        q = self.sketch(pts, closed, 1)
+                        out.append(f'<path d="M{" L".join(f"{x:.3f} {y:.3f}" for x, y in q)}{" Z" if closed else ""}" stroke-width="{lw * 0.5:.3f}"/>')
+                    pts = self.sketch(pts, closed)
                 d = "M" + " L".join(f"{x:.3f} {y:.3f}" for x, y in pts) + (" Z" if closed else "")
                 da = f' stroke-dasharray="{dash[0]} {dash[1]}"' if dash else ""
-                out.append(f'<path d="{d}" stroke-width="{lw}"{da}/>')
-        out.append('</g><g fill="#fff" stroke="none">')
-        for it in self.items:
+                out.append(f'<path d="{d}" stroke-width="{lw}"{da}{cls(i)}/>')
+        out.append(f'</g><g fill="{paper}" stroke="none">')
+        for i, it in enumerate(self.items):
             if it[0] == "blank":
-                out.append(f'<rect x="{it[1]:.3f}" y="{it[2]:.3f}" width="{it[3]:.3f}" height="{it[4]:.3f}"/>')
-        out.append('</g><g fill="#111" stroke="none">')
-        for it in self.items:
+                out.append(f'<rect x="{it[1]:.3f}" y="{it[2]:.3f}" width="{it[3]:.3f}" height="{it[4]:.3f}"{cls(i)}/>')
+        out.append(f'</g><g fill="{ink}" stroke="none">')
+        for i, it in enumerate(self.items):
             if it[0] == "tri":
-                out.append('<path d="M' + " L".join(f"{x:.3f} {y:.3f}" for x, y in it[1]) + ' Z"/>')
-        out.append('</g><g font-family="Helvetica, Arial, sans-serif">')
-        for it in self.items:
+                out.append('<path d="M' + " L".join(f"{x:.3f} {y:.3f}" for x, y in it[1]) + f' Z"{cls(i)}/>')
+        italic = ' font-style="italic"' if self.style == "sketch" else ""
+        out.append(f'</g><g font-family="Helvetica, Arial, sans-serif"{italic}>')
+        for i, it in enumerate(self.items):
             if it[0] == "text":
                 _, x, y, s, size, align, bold, grey, rot = it
                 anchor = {"left": "start", "center": "middle", "right": "end"}[align]
                 tr = f' transform="rotate(-90 {x:.3f} {y:.3f})"' if rot else ""
                 fw = ' font-weight="bold"' if bold else ""
                 out.append(f'<text x="{x:.3f}" y="{y:.3f}" font-size="{size}" text-anchor="{anchor}" dominant-baseline="middle"{tr}'
-                           f'{fw} fill="{"#666" if grey else "#111"}">{esc(s)}</text>')
+                           f'{fw} fill="{grey_c if grey else ink}"{cls(i, True)}>{esc(s)}</text>')
         out.append("</g>")
-        for it in self.items:
+        for i, it in enumerate(self.items):
             if it[0] == "image":
                 _, x, y, w, h, img = it
-                out.append(f'<image x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{h:.3f}" href="data:image/png;base64,{img["b64"]}"/>')
+                out.append(f'<image x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{h:.3f}" href="data:image/png;base64,{img["b64"]}"{cls(i)}/>')
         out.append("</svg>")
         return "\n".join(out)
 
@@ -290,17 +349,32 @@ class Sheet:
         k = 72 / 25.4
         X = lambda x: x * k
         Y = lambda y: (self.h - y) * k
-        ops = ["1 J 1 j 0.067 0.067 0.067 RG 0.067 0.067 0.067 rg"]
+        rgb = lambda c: " ".join(f"{v:.3f}" for v in c)
+        paper, ink, grey_c, grid = self.colors()
+        INK = f"{rgb(ink)} RG {rgb(ink)} rg"
+        ops = ["1 J 1 j"]
+        if paper != (1, 1, 1):
+            ops.append(f"{rgb(paper)} rg 0 0 {self.w * k:.2f} {self.h * k:.2f} re f")
+        if grid:
+            ops.append(f"{rgb(grid)} RG {0.1 * k:.3f} w [] 0 d " + " ".join(f"{X(x):.2f} 0 m {X(x):.2f} {self.h * k:.2f} l S" for x in range(10, int(self.w), 10))
+                       + " " + " ".join(f"0 {Y(y):.2f} m {self.w * k:.2f} {Y(y):.2f} l S" for y in range(10, int(self.h), 10)))
+        ops.append(INK)
         for it in self.items:
             if it[0] == "poly":
                 _, pts, lw, dash, closed = it
+                if self.style == "sketch":
+                    if lw >= 0.3:
+                        q = self.sketch(pts, closed, 1)
+                        ops.append(f"{lw * 0.5 * k:.3f} w [] 0 d " + " ".join(f"{X(x):.2f} {Y(y):.2f} {'m' if i == 0 else 'l'}" for i, (x, y) in enumerate(q))
+                                   + (" h S" if closed else " S"))
+                    pts = self.sketch(pts, closed)
                 ops.append(f"{lw * k:.3f} w " + (f"[{dash[0] * k:.2f} {dash[1] * k:.2f}] 0 d" if dash else "[] 0 d"))
                 ops.append(" ".join(f"{X(x):.2f} {Y(y):.2f} {'m' if i == 0 else 'l'}" for i, (x, y) in enumerate(pts)) + (" h S" if closed else " S"))
             elif it[0] == "tri":
                 ops.append(" ".join(f"{X(x):.2f} {Y(y):.2f} {'m' if i == 0 else 'l'}" for i, (x, y) in enumerate(it[1])) + " h f")
             elif it[0] == "blank":
                 _, x, y, w, h = it
-                ops.append(f"1 g {X(x):.2f} {Y(y + h):.2f} {w * k:.2f} {h * k:.2f} re f 0.067 0.067 0.067 rg")
+                ops.append(f"{rgb(paper)} rg {X(x):.2f} {Y(y + h):.2f} {w * k:.2f} {h * k:.2f} re f {rgb(ink)} rg")
             elif it[0] == "image":
                 _, x, y, w, h, _img = it
                 ops.append(f"q {w * k:.2f} 0 0 {h * k:.2f} {X(x):.2f} {Y(y + h):.2f} cm /Im1 Do Q")
@@ -312,13 +386,14 @@ class Sheet:
             w = text_width(s, bold) * pt
             off = {"left": 0, "center": w / 2, "right": w}[align]
             raw = s.encode("cp1252", "replace").replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
-            col = "0.4 0.4 0.4 rg 0.4 0.4 0.4 RG" if grey else "0.067 0.067 0.067 rg 0.067 0.067 0.067 RG"
+            col = f"{rgb(grey_c)} rg {rgb(grey_c)} RG" if grey else INK
             if rot:
                 tm = f"0 1 -1 0 {X(x) + pt * 0.35:.2f} {Y(y) - off:.2f} Tm"
             else:
                 tm = f"1 0 0 1 {X(x) - off:.2f} {Y(y) - pt * 0.35:.2f} Tm"
             mode = f"[] 0 d {pt * 0.045:.3f} w 2 Tr" if bold else "0 Tr"
-            ops.append(f"BT {col} {mode} /F1 {pt:.2f} Tf {tm} (" + raw.decode("latin-1") + ") Tj ET")
+            font = "/F2" if self.style == "sketch" else "/F1"
+            ops.append(f"BT {col} {mode} {font} {pt:.2f} Tf {tm} (" + raw.decode("latin-1") + ") Tj ET")
         return "\n".join(ops).encode("latin-1")
 
 
@@ -330,13 +405,15 @@ def pdf(sheets):
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"]
     img = next((it[5] for sh in sheets for it in sh.items if it[0] == "image"), None)
     xo = f" /XObject << /Im1 {4 + 2 * n} 0 R >>" if img else ""
+    f2 = 4 + 2 * n + (1 if img else 0)
     for i, sh in enumerate(sheets):
-        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {sh.w * k:.2f} {sh.h * k:.2f}] /Resources << /Font << /F1 3 0 R >>{xo} >> "
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {sh.w * k:.2f} {sh.h * k:.2f}] /Resources << /Font << /F1 3 0 R /F2 {f2} 0 R >>{xo} >> "
                     f"/Contents {5 + 2 * i} 0 R >>")
         objs.append(sh.pdf_content())
     if img:
         objs.append((f"/Type /XObject /Subtype /Image /Width {img['w']} /Height {img['h']} /ColorSpace /DeviceRGB "
                      "/BitsPerComponent 8 /Filter /FlateDecode", img["z"]))
+    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>")
     buf, offs = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"), []
     for i, o in enumerate(objs, 1):
         offs.append(len(buf))
@@ -418,6 +495,9 @@ TEXTS = {
            "AUTHOR": "AUTEUR", "FILE": "FICHIER", "UNIT": "UNITÉ", "REV": "RÉV.", "NUMBER": "N° DE PLAN", "SCALE": "ÉCHELLE",
            "SIZE": "FORMAT", "SHEET": "FEUILLE", "DATE": "DATE", "DESC": "DESCRIPTION", "REMARKS": "REMARQUES", "ITEM": "REP.",
            "PART": "DÉSIGNATION", "QTY": "QTÉ", "BOM": "NOMENCLATURE", "LEGEND": "LÉGENDE", "CODE": "ABRÉV.", "TOTAL": "TOTAL", "more": "… {n} autres lignes",
+           "CHECKED": "VÉRIFIÉ", "APPROVED": "APPROUVÉ", "TOL": "TOLÉRANCES GÉNÉRALES", "TOL_asme": "TOLÉRANCES SAUF INDICATION",
+           "MATERIAL": "MATIÈRE", "annex_see": "NOMENCLATURE : VOIR FEUILLE {n}", "tol_table": "TOLÉRANCES GÉNÉRALES ISO 2768-{c} (mm)",
+           "tol_size": "COTE", "tol_dev": "ÉCART", "annex_cont": "NOMENCLATURE (SUITE)",
            "dims": "COTES EN {u} · ENCOMBREMENT (L × P × H) {a} × {b} × {c}", "origin": "DEPUIS L’ORIGINE DU MONDE : ",
            "range": "{a} de {lo} à {hi}", "hidden": "TRAITS CACHÉS EN POINTILLÉS", "hidden_main": " (PRINCIPAUX SEULEMENT)",
            "nothing": "aucun objet à dessiner", "noview": "aucune vue choisie", "nothing_on": "aucun objet à dessiner sur la feuille « {s} »",
@@ -434,6 +514,9 @@ TEXTS = {
            "AUTHOR": "DRAWN BY", "FILE": "FILE", "UNIT": "UNIT", "REV": "REV.", "NUMBER": "DWG NO.", "SCALE": "SCALE",
            "SIZE": "SIZE", "SHEET": "SHEET", "DATE": "DATE", "DESC": "DESCRIPTION", "REMARKS": "NOTES", "ITEM": "ITEM",
            "PART": "PART", "QTY": "QTY", "BOM": "BILL OF MATERIALS", "LEGEND": "LEGEND", "CODE": "ABBR.", "TOTAL": "TOTAL", "more": "… {n} more rows",
+           "CHECKED": "CHECKED", "APPROVED": "APPROVED", "TOL": "GENERAL TOLERANCES", "TOL_asme": "TOLERANCES UNLESS NOTED",
+           "MATERIAL": "MATERIAL", "annex_see": "BILL OF MATERIALS: SEE SHEET {n}", "tol_table": "GENERAL TOLERANCES ISO 2768-{c} (mm)",
+           "tol_size": "SIZE", "tol_dev": "DEVIATION", "annex_cont": "BILL OF MATERIALS (CONTINUED)",
            "dims": "DIMENSIONS IN {u} · OVERALL (W × D × H) {a} × {b} × {c}", "origin": "FROM WORLD ORIGIN: ",
            "range": "{a} {lo} to {hi}", "hidden": "HIDDEN LINES DASHED", "hidden_main": " (MAIN LINES ONLY)",
            "nothing": "nothing to draw", "noview": "no view selected", "nothing_on": "nothing to draw on sheet “{s}”",
@@ -443,7 +526,7 @@ TEXTS = {
            "view_done": "{v}: {n} points in {t:.1f} s",
            "views": {"Face": "front", "Gauche": "left", "Droite": "right", "Dessus": "top", "Perspective": "isometric"}}}
 
-F_ROW, OWN_ROW, REV_ROW, REM_LINE, REM_SIZE = 8, 4.5, 4.5, 3.2, 2.2
+F_ROW, OWN_ROW, REV_ROW, REM_LINE, REM_SIZE = 8, 4.5, 4.5, 3.6, 2.5
 
 
 def wrap(text, width, size):
@@ -463,39 +546,110 @@ def wrap(text, width, size):
     return out
 
 
-def tb_extras(SPEC):
+ISO2768_RANGES = ((0.5, 3), (3, 6), (6, 30), (30, 120), (120, 400), (400, 1000), (1000, 2000), (2000, 4000))
+ISO2768 = {"f": (0.05, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, None), "m": (0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 1.2, 2),
+           "c": (0.2, 0.3, 0.5, 0.8, 1.2, 2, 3, 4), "v": (None, 0.5, 1, 1.5, 2.5, 4, 6, 8)}
+
+
+def tb_extras(SPEC, TX=None, asme=False):
     revs = [(str(r.get("rev") or ""), str(r.get("desc") or ""), str(r.get("date") or "")) for r in SPEC.get("revisions") or []]
     revs = [r for r in revs if any(r)]
     fields = [(str(f.get("key") or ""), str(f.get("value") or "")) for f in SPEC.get("fields") or []]
-    fields = [f for f in fields if any(f)]
+    TX = TX or TEXTS["fr"]
+    std = [(TX[k], str(SPEC.get(n) or "").strip()) for k, n in (("CHECKED", "checked"), ("APPROVED", "approved"),
+                                                                 ("TOL_asme" if asme else "TOL", "tolerances"), ("MATERIAL", "material"))]
+    fields = [f for f in std if f[1]] + [f for f in fields if any(f)]
     owner = str(SPEC.get("owner") or "").strip()
     legend = [(str(r.get("code") or ""), str(r.get("desc") or "")) for r in SPEC.get("legend") or []]
     legend = [r for r in legend if any(r)]
     rem = wrap(SPEC.get("remarks") or "", planlayout.TB_W - 4, REM_SIZE)
+    tol = SPEC.get("tol_table") if SPEC.get("tol_table") in ISO2768 else ""
     inside = F_ROW * -(-len(fields) // 4) + (OWN_ROW if owner else 0)
     above = ((len(revs) + 1) * REV_ROW + 4 if revs else 0) + (5 + len(rem) * REM_LINE + 2 if rem else 0) + (
-        (len(legend) + 1) * REV_ROW + 5 if legend else 0)
-    return {"revs": revs, "fields": fields, "owner": owner, "legend": legend, "rem": rem, "inside": inside, "above": above}
+        (len(legend) + 1) * REV_ROW + 5 if legend else 0) + (2 * REV_ROW + 5 if tol else 0)
+    return {"revs": revs, "fields": fields, "owner": owner, "legend": legend, "rem": rem, "inside": inside, "above": above, "tol": tol}
 
 
 BOM_MAX = 30
 
 
 def bom_rows(objs, by="name", prop=""):
-    import re
     count = {}
     for o in {root_of(x).name: root_of(x) for x in objs}.values():
-        if by == "collection":
-            k = o.users_collection[0].name if o.users_collection else "—"
-        elif by == "property":
-            k = str(o.get(prop, "—")) if prop else "—"
-        else:
-            k = re.sub(r"\.\d{3,}$", "", o.name)
+        k = bom_key(o, by, prop)
         count[k] = count.get(k, 0) + 1
     return sorted(count.items(), key=lambda kv: kv[0].lower())
 
 
+def bom_key(o, by="name", prop=""):
+    import re
+    if by == "collection":
+        return o.users_collection[0].name if o.users_collection else "—"
+    if by == "property":
+        return str(o.get(prop, "—")) if prop else "—"
+    return re.sub(r"\.\d{3,}$", "", o.name)
+
+
+def balloon_points(by_root, bom, by="name", prop=""):
+    dg = bpy.context.evaluated_depsgraph_get()
+    item = {k: str(i) for i, (k, _) in enumerate(bom, 1)}
+    cands = {}
+    for ro, objs in by_root.values():
+        k = bom_key(ro, by, prop)
+        if k not in item:
+            continue
+        pts = []
+        for o in objs:
+            ev = o.evaluated_get(dg)
+            pts += [ev.matrix_world @ Vector(c) for c in ev.bound_box]
+        vol = (max(p.x for p in pts) - min(p.x for p in pts)) * (max(p.y for p in pts) - min(p.y for p in pts)) * (max(p.z for p in pts) - min(p.z for p in pts))
+        cands.setdefault(k, []).append((vol, objs))
+    return [(item[k], [objs for _, objs in sorted(c, key=lambda c: -c[0])]) for k, c in cands.items()]
+
+
+def balloon_view(cam, bpts, reach):
+    dg = bpy.context.evaluated_depsgraph_get()
+    inv = cam.matrix_world.inverted()
+    d = (cam.matrix_world.to_3x3() @ Vector((0, 0, -1))).normalized()
+    out = []
+    for t, groups in bpts:
+        found = None
+        for objs in groups[:12]:
+            names = {o.name for o in objs}
+            samples = []
+            for o in objs:
+                ev = o.evaluated_get(dg)
+                if ev.type != "MESH":
+                    continue
+                me = ev.to_mesh()
+                step = max(1, len(me.polygons) // 300)
+                samples += [ev.matrix_world @ me.polygons[n].center for n in range(0, len(me.polygons), step)]
+                ev.to_mesh_clear()
+            if not samples:
+                continue
+            q = [inv @ p for p in samples]
+            cx, cy = sum(v.x for v in q) / len(q), sum(v.y for v in q) / len(q)
+            w, h = max(v.x for v in q) - min(v.x for v in q), max(v.y for v in q) - min(v.y for v in q)
+            tol = max(w, h, 1e-6) * 0.01
+            seen = []
+            for p, v in zip(samples, q):
+                hit, loc, _, _, obj, _ = bpy.context.scene.ray_cast(dg, p - d * reach, d)
+                if hit and obj is not None and obj.name in names and (loc - p).length <= tol:
+                    seen.append(v)
+            if seen and (found is None or len(seen) > found[0]):
+                v = min(seen, key=lambda v: (v.x - cx) ** 2 + (v.y - cy) ** 2)
+                found = (len(seen), (t, v.xy[:], w, h))
+        found = found and found[1]
+        if not found:
+            pts = [inv @ (o.matrix_world @ Vector(c)) for o in groups[0] for c in o.bound_box]
+            xs, ys = [p.x for p in pts], [p.y for p in pts]
+            found = (t, ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2), max(xs) - min(xs), max(ys) - min(ys))
+        out.append(found)
+    return out
+
+
 LABEL_SIZE = 2
+BALLOON_SIZE = 5
 
 
 def label_points(by_root, by="name", prop="", strip=False):
@@ -529,9 +683,52 @@ def label_view(cam, lpts):
     return out
 
 
-def bom_height(rows):
+def manual_view(cam, dims, unit_mm, key, ext):
+    inv = cam.matrix_world.inverted()
+    mx, my = (ext[1] - ext[0]) * 0.1 + 1e-6, (ext[3] - ext[2]) * 0.1 + 1e-6
+    inside = lambda q: ext[0] - mx <= q.x <= ext[1] + mx and ext[2] - my <= q.y <= ext[3] + my
+    out = []
+    for d in dims:
+        a, b = Vector(d.get("a") or (0, 0, 0)), Vector(d.get("b") or (0, 0, 0))
+        qa, qb = inv @ a, inv @ b
+        if not (inside(qa) or inside(qb)):
+            continue
+        view = d.get("view") or "auto"
+        if view == "auto":
+            L = (b - a).length
+            if L > 1e-9 and abs(qa.z - qb.z) <= 0.01 * L:
+                out.append((qa.xy[:], qb.xy[:], L * unit_mm))
+        elif view == key and (qb.xy - qa.xy).length > 1e-9:
+            n = [float(c) for c in cam.matrix_world.col[2][:3]]
+            n = [round(c) if abs(abs(c) - 1) < 1e-4 or abs(c) < 1e-4 else c for c in n]
+            dv = [float(b[i]) - float(a[i]) for i in range(3)]
+            nn = math.sqrt(sum(c * c for c in n))
+            dot = sum(dv[i] * n[i] for i in range(3)) / nn
+            out.append((qa.xy[:], qb.xy[:], math.sqrt(max(sum(c * c for c in dv) - dot * dot, 0)) * unit_mm))
+    return out
+
+
+def bom_height(rows, annex=False):
+    if annex:
+        return 7 if rows else 0
     n = min(len(rows), BOM_MAX) + (1 if len(rows) > BOM_MAX else 0)
     return (n + 3) * REV_ROW + 2 if rows else 0
+
+
+def annex_pages(bom, sw, sh, inside, lang="fr"):
+    m, ml = planlayout.MARGIN, planlayout.MARGIN_L
+    x0, x1 = ml + planlayout.INSET, sw - m - planlayout.INSET
+    cw = min(planlayout.TB_W, x1 - x0)
+    ncol = max(1, int((x1 - x0 + 10) // (cw + 10)))
+    per = max(5, int((sh - m - planlayout.TB_H - inside - 6 - (m + planlayout.BAND + 6)) // REV_ROW) - 1)
+    rows = [(str(i), k, str(q)) for i, (k, q) in enumerate(bom, 1)] + [("", TEXTS[lang]["TOTAL"], str(sum(q for _, q in bom)))]
+    pages, cols = [], []
+    for i in range(0, len(rows), per):
+        cols.append(rows[i:i + per])
+    for i in range(0, len(cols), ncol):
+        pages.append({"w": sw, "h": sh, "land": sw > sh, "views": [],
+                      "annex": [(x0 + j * (cw + 10), c) for j, c in enumerate(cols[i:i + ncol])], "annex_w": cw})
+    return pages
 
 
 UNITS = {"mm": (1, "MM"), "cm": (10, "CM"), "m": (1000, "M"), "in": (25.4, "IN")}
@@ -559,31 +756,31 @@ def zone_labels(n, letters):
 
 
 def frame(P, sw, sh):
-    m, o = planlayout.MARGIN, 5
+    m, ml, o = planlayout.MARGIN, planlayout.MARGIN_L, 5
     P.poly([(o, o), (sw - o, o), (sw - o, sh - o), (o, sh - o)], 0.18, closed=True)
-    P.poly([(m, m), (sw - m, m), (sw - m, sh - m), (m, sh - m)], 0.5, closed=True)
+    P.poly([(ml, m), (sw - m, m), (sw - m, sh - m), (ml, sh - m)], 0.7, closed=True)
     for horiz in (True, False):
-        length = (sw if horiz else sh) - 2 * m
+        length = (sw - ml - m) if horiz else sh - 2 * m
         n = max(2, 2 * round(length / 100))
         step = length / n
         for i, lab in enumerate(zone_labels(n, not horiz)):
-            a = m + i * step
+            a = (ml if horiz else m) + i * step
             if i:
                 if horiz:
                     P.line(a, o, a, m, 0.18)
                     P.line(a, sh - m, a, sh - o, 0.18)
                 else:
-                    P.line(o, a, m, a, 0.18)
+                    P.line(o, a, ml, a, 0.18)
                     P.line(sw - m, a, sw - o, a, 0.18)
             c = a + step / 2
             if horiz:
                 P.text(c, (o + m) / 2, lab, 2.5, "center")
                 P.text(c, sh - (o + m) / 2, lab, 2.5, "center")
             else:
-                P.text((o + m) / 2, c, lab, 2.5, "center")
+                P.text((o + ml) / 2, c, lab, 2.5, "center")
                 P.text(sw - (o + m) / 2, c, lab, 2.5, "center")
-    for x, y, dx, dy in ((sw / 2, 0, 0, 1), (sw / 2, sh, 0, -1), (0, sh / 2, 1, 0), (sw, sh / 2, -1, 0)):
-        P.line(x + dx * 2, y + dy * 2, x + dx * (m + 1.5), y + dy * (m + 1.5), 0.6)
+    for x, y, dx, dy, mm in ((sw / 2, 0, 0, 1, m), (sw / 2, sh, 0, -1, m), (0, sh / 2, 1, 0, ml), (sw, sh / 2, -1, 0, m)):
+        P.line(x + dx * o, y + dy * o, x + dx * (mm + 2.5), y + dy * (mm + 2.5), 0.7)
 
 
 def circle(P, cx, cy, r, lw):
@@ -596,8 +793,8 @@ def angle_symbol(P, x, y, third=False):
     P.poly([(tx, y - h), (tx + 6, y - 2 * h), (tx + 6, y + 2 * h), (tx, y + h)], 0.25, closed=True)
     circle(P, cx, y, 2 * h, 0.25)
     circle(P, cx, y, h, 0.25)
-    P.line(x - 1, y, x + 6 + 3.5 + 4 * h + 1, y, 0.09)
-    P.line(cx, y - 2 * h - 0.8, cx, y + 2 * h + 0.8, 0.09)
+    P.line(x - 1, y, x + 6 + 3.5 + 4 * h + 1, y, 0.13)
+    P.line(cx, y - 2 * h - 0.8, cx, y + 2 * h + 0.8, 0.13)
 
 
 def view_axes(cam):
@@ -732,8 +929,8 @@ def scale_bar(P, x1, y, scale, unit="mm", lang="fr"):
             P.tri([(a, y), (b, y + 1.4), (a, y + 1.4)])
     for i in (0, 5):
         v = real * i / 5
-        P.text(x0 + w * i / 5, y - 2, f"{v:g}".replace(".", "," if unit != "in" and lang == "fr" else "."), 2, "center")
-    P.text(x0 - 3, y + 0.7, name, 2, "right", grey=True)
+        P.text(x0 + w * i / 5, y - 2, f"{v:g}".replace(".", "," if unit != "in" and lang == "fr" else "."), 1.8, "center")
+    P.text(x0 - 3, y + 0.7, name, 1.8, "right", grey=True)
 
 
 def run(SPEC, OUT, progress=None):
@@ -747,9 +944,25 @@ def run(SPEC, OUT, progress=None):
     unit2 = SPEC.get("unit2") if SPEC.get("unit2") in UNITS and SPEC.get("unit2") != unit else None
     fmt2 = unit_fmt(unit2, lang) if unit2 else None
 
+    DIMV = []
+
     def dual(v):
+        DIMV.append(v)
         return f"{fmt(v)} [{fmt2(v)}]" if unit2 else fmt(v)
-    XT = tb_extras(SPEC)
+    global ASME, DT, D1, EXT_GAP, EXT_OVER, TICKS
+    std = SPEC.get("standard") or ("asme" if third else "iso")
+    ASME = std == "asme"
+    ART = (SPEC.get("art_style") or "present") if std == "art" else ""
+    if ART in ("present", "sketch"):
+        W = {"present": {"contour": 0.6, "detail": 0.18, "cache": 0.18}, "sketch": {"contour": 0.45, "detail": 0.25, "cache": 0.2}}[ART]
+    plain = ART in ("present", "sketch")
+    DT = 2.5 if (SPEC.get("sheet") or "A3") in ("A4", "Letter") else 3.5
+    D1, EXT_GAP, EXT_OVER = 10, (1.5 if ASME else 0), (3 if ASME else 2)
+    TICKS = bool(SPEC.get("chain_ticks"))
+    ARROW[:] = [3.0, math.atan(1 / 6) if ASME else math.radians(15)]
+    bsize = 3.5 if DT < 3.5 else BALLOON_SIZE
+    planlayout.MARGIN_L = 20 if SPEC.get("filing", not ASME) and not ART else planlayout.MARGIN
+    XT = tb_extras(SPEC, TX, ASME)
     GR = SPEC.get("grid") or {}
     LB = SPEC.get("labels") or {}
     gmode = GR.get("mode") if GR.get("mode") in ("ruler", "grid") and GR.get("views") else None
@@ -760,7 +973,7 @@ def run(SPEC, OUT, progress=None):
     gi = [0, 1]
     def tell(f, msg):
         tell0(min(0.97, (gi[0] + f) / gi[1] * 0.95), msg)
-    def group(only, hide, label, vw=None):
+    def group(only, hide, label, vw=None, with_bom=True):
         objs = keep_objects(only, hide)
         if not objs:
             raise RuntimeError(TX["nothing_on"].format(s=label) if label else TX["nothing"])
@@ -801,8 +1014,15 @@ def run(SPEC, OUT, progress=None):
         umain = UNITS[unit][0] / unit_mm
         gstep = float(GR.get("step") or 0) * umain or nice_step(max(size) / umain) * umain
         gorg = Vector(GR.get("origin") or (0, 0, 0))
-        BM = SPEC.get("bom") or {}
-        bom = bom_rows(objs, BM.get("by") or "name", BM.get("prop") or "") if BM.get("by") else []
+        BM = (SPEC.get("bom") or {}) if with_bom else {}
+        bset = set(BM["only"]) if BM.get("only") is not None else None
+        bobjs = [o for o in objs if bset is None or o.name in bset or root_of(o).name in bset]
+        bom = bom_rows(bobjs, BM.get("by") or "name", BM.get("prop") or "") if BM.get("by") and bobjs else []
+        bviews = {dict(vmap, iso="Perspective")[x] for x in (SPEC.get("balloons") or {}).get("views") or [] if x in vmap or x == "iso"} if bom else set()
+        broot = by_root if bset is None else {k: v for k, v in by_root.items() if k in bset or any(o.name in bset for o in v[1])}
+        bpts = balloon_points(broot, bom, BM.get("by") or "name", BM.get("prop") or "") if bviews else []
+        amode = BM.get("annex") or "auto"
+        annex = bool(bom) and (amode == "always" or (amode == "auto" and len(bom) > BOM_MAX))
         rows = max([sum(CHAIN_ROW + (POS_ROW if c[4] else 0) for c in chains if c[0] == n) for n, _, _ in VIEWS] + [0])
         if not VIEWS:
             raise RuntimeError(TX["noview"])
@@ -812,7 +1032,10 @@ def run(SPEC, OUT, progress=None):
         L = planlayout.layout({n: odims[n] for n, _, _ in VIEWS if n in odims},
                               (ex[1] - ex[0]) / max(ex[3] - ex[2], 1e-9) if ex else None, SPEC.get("sheet") or "A3", SPEC.get("land", True),
                               SPEC.get("scale"), planlayout.IMPERIAL if unit == "in" else planlayout.SCALES, lang, rows,
-                              XT["inside"] + XT["above"] + bom_height(bom), gtop, gtop, third)
+                              XT["inside"] + XT["above"] + bom_height(bom, annex), gtop, gtop, third,
+                              max(0, (text_width(dual(real.z)) * DT + 2) / 2 + D1 - planlayout.RIGHT) if ASME else 0)
+        if annex:
+            L["pages"] += annex_pages(bom, L["pages"][0]["w"], L["pages"][0]["h"], XT["inside"], lang)
         drawn, trimmed = {}, 0
         steps = [f"{label + ' : ' if label else ''}" + TX["hidden_skip"].format(n=format(tris, ",").replace(",", " " if lang == "fr" else ","))] if skip_hidden else []
         warnings.extend(steps)
@@ -832,14 +1055,18 @@ def run(SPEC, OUT, progress=None):
                            "axes": view_axes(cam), "chains": [chain_info(cam, chain_positions(cam, co, ref), rel, pos, unit_mm)
                                       for vn, co, ref, rel, pos in chains if vn == name],
                            "grid": grid_ticks(cam, lo, hi, ctr, gstep, gorg) if name in gviews else None,
-                           "labels": label_view(cam, lpts) if name in lviews else []}
+                           "labels": label_view(cam, lpts) if name in lviews else [],
+                           "balloons": balloon_view(cam, bpts, r * 4) if name in bviews else [],
+                           "manual": manual_view(cam, SPEC.get("manual_dims") or [], unit_mm, {"Face": "front", "Dessus": "top"}.get(name, "side"), ext)
+                           if name != "Perspective" else []}
             bpy.data.objects.remove(gp)
             bpy.data.objects.remove(cam)
             steps.append(f"{label + ' · ' if label else ''}" + TX["view_done"].format(v=TX["views"][name], n=sum(len(x) for k in ("contour", "detail") for x in S.get(k, [])), t=time.time() - t))
         if trimmed:
             infos.append(f"{label + ' : ' if label else ''}" + TX["hidden_trim_all"].format(n=trimmed, s="s" if trimmed > 1 else ""))
         return {"label": label, "drawn": drawn, "scale": L["scale"], "pages": L["pages"], "note": L["note"], "real": real, "lo": lo, "hi": hi,
-                "hidden": hidden and any(d["cache"] for d in drawn.values()), "trimmed": trimmed, "steps": steps, "objects": len(objs), "unit_mm": unit_mm, "bom": bom}
+                "hidden": hidden and any(d["cache"] for d in drawn.values()), "trimmed": trimmed, "steps": steps, "objects": len(objs), "unit_mm": unit_mm, "bom": bom,
+                "annex": annex}
 
     realize_instances()
     groups = SPEC.get("sheets") or [{"name": "", "only": SPEC.get("only"), "hide": SPEC.get("hide")}]
@@ -847,7 +1074,7 @@ def run(SPEC, OUT, progress=None):
     gi[1] = len(groups)
     for i, g in enumerate(groups):
         gi[0] = i
-        G.append(group(g.get("only"), g.get("hide"), g.get("name") or "", g.get("views")))
+        G.append(group(g.get("only"), g.get("hide"), g.get("name") or "", g.get("views"), g.get("bom", True)))
     steps = [st for g in G for st in g["steps"]]
     jobs = [(g, pg) for g in G for pg in g["pages"]]
     notes = [(f"{g['label']} : " if g["label"] else "") + g["note"] for g in G if g["note"]]
@@ -860,7 +1087,8 @@ def run(SPEC, OUT, progress=None):
     def place(P, v):
         ex = drawn[v["name"]]["ext"]
         k = v["w"] / max(ex[1] - ex[0], 1e-9) if v["name"] == "Perspective" else k_paper
-        for layer, lw, dash in (("cache", W["cache"], (1.0, 0.7)), ("detail", W["detail"], None), ("contour", W["contour"], None)):
+        for layer, lw, dash in (("cache", W["cache"], (12 * W["cache"], 3 * W["cache"])), ("detail", W["detail"], None), ("contour", W["contour"], None)):
+            P.layer = "HIDDEN" if layer == "cache" else "VISIBLE"
             for st in drawn[v["name"]][layer]:
                 pts, last = [], None
                 for x, y in st:
@@ -870,16 +1098,20 @@ def run(SPEC, OUT, progress=None):
                         last = q
                 if len(pts) >= 2:
                     P.poly(pts, lw, dash)
+        P.layer = "FRAME"
 
-    def labels_of(P, v):
+    def labels_of(P, v, balloon=False):
         ex = drawn[v["name"]]["ext"]
         k = v["w"] / max(ex[1] - ex[0], 1e-9) if v["name"] == "Perspective" else k_paper
-        size = min(max(float(LB.get("size") or LABEL_SIZE), 1), 6)
-        h = size + 0.8
+        size = bsize if balloon else min(max(float(LB.get("size") or LABEL_SIZE), 1), 6)
+        h = size * 2 if balloon else size + 0.8
         hit = lambda a, b: a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
         taken, out = [], []
-        for t, (x, y), ow, oh in sorted(drawn[v["name"]]["labels"], key=lambda it: -it[3] * it[2]):
-            L = text_width(t) * size + 1.2
+        for t, (x, y), ow, oh in sorted(drawn[v["name"]]["balloons" if balloon else "labels"], key=lambda it: -it[3] * it[2]):
+            L = h if balloon else text_width(t) * size + 1.2
+            if balloon:
+                out.append((t, v["x"] + (x - ex[0]) * k, v["y"] + (ex[3] - y) * k, L))
+                continue
             rot = L > ow * k and oh > ow * 1.5
             w, hh = (h, L) if rot else (L, h)
             px, py = v["x"] + (x - ex[0]) * k, v["y"] + (ex[3] - y) * k
@@ -891,15 +1123,26 @@ def run(SPEC, OUT, progress=None):
             P.blank(box[0], box[1], w, hh)
             P.text(px, py, t, size, "center", rot=rot)
         mid = v["x"] + v["w"] / 2
-        gap = 4 if v["name"] == "Perspective" else 13
+        gap = 4 if v["name"] == "Perspective" else D1 + 6
         lx, rx = v["x"] - 4, v["x"] + v["w"] + gap
-        room = lambda side, its: (lx - 1.6 - max(it[3] for it in its) >= planlayout.MARGIN + 3 if side < 0
+        room = lambda side, its: (lx - 1.6 - max(it[3] for it in its) >= planlayout.MARGIN_L + 3 if side < 0
                                   else rx + 1.6 + max(it[3] for it in its) <= P.w - planlayout.MARGIN - 3)
         sides = {-1: [it for it in out if it[1] < mid], 1: [it for it in out if it[1] >= mid]}
+        if balloon and v["name"] != "Perspective" and out and room(-1, out):
+            sides = {-1: out, 1: []}
         for a in (-1, 1):
             if sides[a] and not room(a, sides[a]) and room(-a, sides[a] + sides[-a]):
                 sides[-a] += sides[a]
                 sides[a] = []
+
+        def span(side):
+            xc = lx if side < 0 else rx
+            over_tb = max(xc, xc + side * (1.6 + h)) > tb_x0
+            return planlayout.MARGIN + planlayout.BAND, (tb_top if over_tb else P.h - planlayout.MARGIN - 3)
+        if balloon:
+            fit = min(((span(sd)[1] - span(sd)[0]) / len(sides[sd]) - 0.6) / 2 for sd in (-1, 1) if sides[sd]) if out else size
+            size = max(2.5, min(size, fit))
+            h = size * 2
         for side in (-1, 1):
             col = sorted(sides[side], key=lambda it: it[2])
             if not col:
@@ -909,51 +1152,137 @@ def run(SPEC, OUT, progress=None):
             for _, _, py, _ in col:
                 last = max(py, last + step)
                 ys.append(last)
-            over = ys[-1] - (v["y"] + v["h"] + 2 * step)
+            y0, y1 = span(side)
+            over = ys[-1] - (min(y1 - h / 2, v["y"] + v["h"] + 2 * step) if not balloon else y1 - h / 2)
             if over > 0:
                 ys = [yy - over for yy in ys]
                 for i in range(len(ys) - 2, -1, -1):
                     ys[i] = min(ys[i], ys[i + 1] - step)
+            if balloon and ys[0] < y0 + h / 2:
+                ys = [yy + y0 + h / 2 - ys[0] for yy in ys]
             xc = lx if side < 0 else rx
             for (t, px, py, L), yy in zip(col, ys):
                 P.line(px, py, xc, yy, 0.12)
                 P.line(xc, yy, xc + side * 1.2, yy, 0.12)
                 circle(P, px, py, 0.25, 0.2)
                 x0 = xc + side * 1.6
+                if balloon:
+                    cx = x0 + side * h / 2
+                    P.blank(cx - h / 2, yy - h / 2, h, h)
+                    circle(P, cx, yy, h / 2, 0.25)
+                    P.text(cx, yy, t, size, "center", bold=True)
+                    continue
                 P.blank(x0 - L if side < 0 else x0, yy - h / 2, L, h)
                 P.text(x0, yy, t, size, "right" if side < 0 else "left")
 
-    def dims_of(P, v, w, h):
+    def dimline(P, a, b, t, n):
+        a, b = Vector(a), Vector(b)
+        d = b - a
+        vert = abs(d.x) < 0.02 * d.length
+
+        def put(c, rot=False):
+            L = text_width(t) * DT + 0.6
+            w, h = (DT, L) if rot else (L, DT)
+            P.blank(c.x - w / 2, c.y - h / 2, w, h)
+            P.text(c.x, c.y, t, DT, "center", rot=rot)
+        if ASME:
+            tw = text_width(t) * DT + 2
+            gap = (DT + 2) if vert else tw
+            fits = d.length > gap + 2 * ARROW[0]
+            P.arrow(*a, *b, gap=gap if fits else 0)
+            c = (a + b) / 2
+            if not fits:
+                c = c + Vector((tw / 2 + 0.5, 0)) if vert else c - Vector(n) * (DT * 0.5 + 1.2)
+            put(c)
+            return
+        out = d.length < 2 * ARROW[0] + 1
+        P.arrow(*a, *b, out=out)
+        c = (a + b) / 2
+        tw = text_width(t) * DT + 0.6
+        if d.length < tw + 1:
+            c = b + d / d.length * ((ARROW[0] + 2 if out else 0) + 1 + tw / 2)
+        if vert:
+            put(c - Vector((DT * 0.5 + 0.8, 0)), True)
+        elif abs(d.y) < 0.02 * d.length:
+            put(c - Vector((0, DT * 0.5 + 0.8)))
+        else:
+            put(c + Vector(n) * (DT * 0.5 + 1.2))
+
+    def ext_line(P, x1, y1, x2, y2):
+        d = Vector((x2 - x1, y2 - y1))
+        u = d / max(d.length, 1e-9)
+        P.line(x1 + u.x * EXT_GAP, y1 + u.y * EXT_GAP, x2 + u.x * EXT_OVER, y2 + u.y * EXT_OVER, W["detail"])
+
+    def dims_of(P, v, w, h, horiz=True, vert=True):
         x0, y0, vw, vh = v["x"], v["y"], v["w"], v["h"]
-        yd, xd = y0 + vh + 6, x0 + vw + 6
-        P.line(x0, y0 + vh + 1, x0, yd + 1.5, 0.13)
-        P.line(x0 + vw, y0 + vh + 1, x0 + vw, yd + 1.5, 0.13)
-        P.line(x0 + vw + 1, y0, xd + 1.5, y0, 0.13)
-        P.line(x0 + vw + 1, y0 + vh, xd + 1.5, y0 + vh, 0.13)
-        P.arrow(x0, yd, x0 + vw, yd)
-        P.text(x0 + vw / 2, yd - 2.2, dual(w), 2.8, "center")
-        P.arrow(xd, y0, xd, y0 + vh)
-        P.text(xd + 2.6, y0 + vh / 2, dual(h), 2.8, "center", rot=True)
+        yd, xd = y0 + vh + D1, x0 + vw + D1
+        if horiz:
+            ext_line(P, x0, y0 + vh, x0, yd)
+            ext_line(P, x0 + vw, y0 + vh, x0 + vw, yd)
+            dimline(P, (x0, yd), (x0 + vw, yd), dual(w), (0, -1))
+        if vert:
+            ext_line(P, x0 + vw, y0, xd, y0)
+            ext_line(P, x0 + vw, y0 + vh, xd, y0 + vh)
+            dimline(P, (xd, y0 + vh), (xd, y0), dual(h), (-1, 0))
+
+    def manual_of(P, v, mds, ex, ybase):
+        paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
+        nh = nv = 0
+        for (xa, ya), (xb, yb), val in mds:
+            pa, pb = paper(xa, ya), paper(xb, yb)
+            d = pb - pa
+            if d.length < 1:
+                continue
+            if abs(d.y) < 0.02 * d.length:
+                nh += 1
+                y = ybase + 7 * nh
+                for p in (pa, pb):
+                    ext_line(P, p.x, p.y, p.x, y)
+                dimline(P, (min(pa.x, pb.x), y), (max(pa.x, pb.x), y), dual(val), (0, -1))
+            elif abs(d.x) < 0.02 * d.length:
+                nv += 1
+                x = v["x"] - 7 * nv
+                for p in (pa, pb):
+                    ext_line(P, p.x, p.y, x, p.y)
+                dimline(P, (x, max(pa.y, pb.y)), (x, min(pa.y, pb.y)), dual(val), (-1, 0))
+            else:
+                n = Vector((-d.y, d.x)) / d.length
+                if n.dot((pa + pb) / 2 - Vector((v["x"] + v["w"] / 2, v["y"] + v["h"] / 2))) < 0:
+                    n = -n
+                a1, b1 = pa + n * 7, pb + n * 7
+                ext_line(P, *pa, *a1)
+                ext_line(P, *pb, *b1)
+                dimline(P, a1, b1, dual(val), n)
 
     def chain_of(P, v, ch, y, ex):
         segs = ch["segs"]
         X = lambda x: v["x"] + (x - ex[0]) * k_paper
         st = sorted({round(X(a), 3) for a, _, _, _ in segs} | {round(X(b), 3) for _, b, _, _ in segs})
-        P.line(st[0], y, st[-1], y, 0.13)
+        P.line(st[0], y, st[-1], y, W["detail"])
         if ch["pos"]:
             for x, w in ch["world"].items():
                 t = fmt(w + 0, 1 if unit == "mm" else None)
                 size = max(1.1, min(1.6, (POS_ROW - 2) / max(text_width(t), 1e-6)))
                 P.text(X(x) + size * 0.45, y + 1.8 + text_width(t) * size / 2, t, size, "center", rot=True)
             P.text(st[0] - 1.5, y + 3, ch["axis"], 1.8, "right", bold=True)
+        AL, s2 = ARROW
         for x in st:
-            P.line(x, v["y"] + v["h"] + 7, x, y + 1.5, 0.09)
+            P.line(x, v["y"] + v["h"] + D1 + 1, x, y + EXT_OVER, W["detail"])
+        ticks = set()
+        for a, b, n, d in segs:
+            xa, xb = X(a), X(b)
+            if TICKS or xb - xa < 2 * AL + 1:
+                ticks |= {round(xa, 3), round(xb, 3)}
+                continue
+            for px, sg in ((xa, 1), (xb, -1)):
+                P.tri([(px, y), (px + sg * AL * math.cos(s2), y - AL * math.sin(s2)), (px + sg * AL * math.cos(s2), y + AL * math.sin(s2))])
+        for x in ticks:
             P.line(x - 0.9, y + 0.9, x + 0.9, y - 0.9, 0.25)
         for a, b, n, d in segs:
             xa, xb = X(a), X(b)
             t = f"{n} × {dual(d)} = {dual(d * n)}" if n > 1 else dual(d)
-            if text_width(t) * 2.2 <= (xb - xa) - 1:
-                P.text((xa + xb) / 2, y - 1.6, t, 2.2, "center")
+            if text_width(t) * 2.5 <= (xb - xa) - 1:
+                P.text((xa + xb) / 2, y - 1.9, t, 2.5, "center")
             else:
                 room = CHAIN_ROW - 1.8
                 if text_width(t) * 1.4 > room:
@@ -988,7 +1317,7 @@ def run(SPEC, OUT, progress=None):
                 P.line(x, yr, x, yr - 1.2, 0.15)
                 t = lab(w)
                 if x - text_width(t) * 0.85 > last + 1:
-                    P.text(x, yr - 3, t, 1.7, "center")
+                    P.text(x, yr - 3, t, 1.8, "center")
                     last = x + text_width(t) * 0.85
             P.text(hx[-1][0] + 1.5, yr - 0.6, gr[0]["axis"], 1.8, bold=True)
         if vy:
@@ -998,7 +1327,7 @@ def run(SPEC, OUT, progress=None):
                 P.line(xr, y, xr - 1.2, y, 0.15)
                 t = lab(w)
                 if y - text_width(t) * 0.85 > last + 1:
-                    P.text(xr - 3, y, t, 1.7, "center", rot=True)
+                    P.text(xr - 3, y, t, 1.8, "center", rot=True)
                     last = y + text_width(t) * 0.85
             P.text(xr - 0.8, vy[-1][0] + 2.5, gr[1]["axis"], 1.8, "center", bold=True)
 
@@ -1013,60 +1342,93 @@ def run(SPEC, OUT, progress=None):
         real_dims = {"Face": (real.x, real.z), "Gauche": (real.y, real.z), "Droite": (real.y, real.z), "Dessus": (real.x, real.y)}
         sw, sh, m = pg["w"], pg["h"], planlayout.MARGIN
         P = Sheet(sw, sh)
-        frame(P, sw, sh)
+        DIMV.clear()
+        P.style = ART
+        if plain:
+            P.poly([(m, m), (sw - m, m), (sw - m, sh - m), (m, sh - m)], 0.5, closed=True)
+        else:
+            frame(P, sw, sh)
+        tb_x0 = sw - m - min(planlayout.TB_W, sw - 2 * m)
+        tb_top = sh - m - planlayout.TB_H - XT["inside"] - planlayout.NOTES - XT["above"] - bom_height(g["bom"], g["annex"]) - 3
         P.text(sw / 2, m + 7, title.upper(), 5, "center", bold=True)
-        P.text(sw / 2, m + 13, f"{g['label']} · {project}" if g["label"] else project, 3.2, "center")
+        sub = f"{g['label']} · {project}" if g["label"] else project
+        if pg.get("annex"):
+            sub = TX["BOM"] + (f" · {sub}" if sub != "—" else "")
+        P.text(sw / 2, m + 13, sub, 3.5, "center")
         only_persp = all(v["name"] == "Perspective" for v in pg["views"])
+        here = [v["name"] for v in pg["views"] if v["name"] in drawn and v["name"] != "Perspective"]
+        own = set()
+        for cands in ((("Face", "h"), ("Dessus", "h")), (("Face", "v"), ("Gauche", "v"), ("Droite", "v")),
+                      (("Gauche", "h"), ("Droite", "h"), ("Dessus", "v"))):
+            own.add(next((c for c in cands if c[0] in here), None))
+        every = bool(SPEC.get("dims_all"))
+        P.scale = None if only_persp else scale
+        P.bom, P.bom_head = g["bom"], (g["label"], TX["ITEM"], TX["PART"], TX["QTY"], TX["TOTAL"])
         for v in pg["views"]:
             if v["name"] not in drawn:
                 continue
             place(P, v)
             if drawn[v["name"]].get("labels"):
                 labels_of(P, v)
+            if drawn[v["name"]].get("balloons"):
+                P.layer = "DIMENSIONS"
+                labels_of(P, v, balloon=True)
+                P.layer = "FRAME"
             persp = v["name"] == "Perspective"
             cx = v["x"] + v["w"] / 2
             head = TX[v["name"]]
             ty0 = v["y"] - (0 if persp else gtop)
-            P.text(cx, ty0 - 7.5, head, 3.5, "center", bold=True)
+            titled = persp or SPEC.get("view_titles", True)
             hw = text_width(head, True) * 3.5
-            P.line(cx - hw / 2, ty0 - 5.3, cx + hw / 2, ty0 - 5.3, 0.25)
-            if SPEC.get("axes", True):
+            if titled:
+                P.text(cx, ty0 - 7.5, head, 3.5, "center", bold=True)
+                P.line(cx - hw / 2, ty0 - 5.3, cx + hw / 2, ty0 - 5.3, W["detail"])
+            if SPEC.get("axes", True) and not plain:
                 axes_triad(P, cx - max(hw, text_width(TX["scale_of"].format(s="1:500")) * 2.2) / 2 - 7, ty0 - 4.5, drawn[v["name"]]["axes"])
+            P.layer = "DIMENSIONS"
             if not persp and drawn[v["name"]].get("grid"):
                 grid_of(P, v, drawn[v["name"]]["grid"], drawn[v["name"]]["ext"])
-            P.text(cx, ty0 - 3, TX["iso"] if persp else TX["scale_of"].format(s=planlayout.label(scale)), 2.2, "center", grey=True)
+            P.layer = "FRAME"
+            if titled:
+                P.text(cx, ty0 - 3, TX["iso"] if persp else TX["scale_of"].format(s=planlayout.label(scale)), 2.5, "center", grey=True)
             if not persp:
-                dims_of(P, v, *real_dims[v["name"]])
-                yc = v["y"] + v["h"] + 6
+                P.layer = "DIMENSIONS"
+                dims_of(P, v, *real_dims[v["name"]], every or (v["name"], "h") in own, every or (v["name"], "v") in own)
+                yc = v["y"] + v["h"] + D1
                 for ch in drawn[v["name"]].get("chains", []):
                     yc += CHAIN_ROW
                     if ch["segs"]:
                         chain_of(P, v, ch, yc, drawn[v["name"]]["ext"])
                     if ch["pos"]:
                         yc += POS_ROW
+                if drawn[v["name"]].get("manual"):
+                    manual_of(P, v, drawn[v["name"]]["manual"], drawn[v["name"]]["ext"], yc)
+                P.layer = "FRAME"
         tb_w, tb_h = min(planlayout.TB_W, sw - 2 * m), planlayout.TB_H
         tx, ty = sw - m - tb_w, sh - m - tb_h - XT["inside"]
         X = lambda f: tx + tb_w * f
         r1, r2, r3 = ty + 7, ty + 20, ty + 28
-        P.poly([(tx, ty), (tx + tb_w, ty), (tx + tb_w, ty + tb_h + XT["inside"]), (tx, ty + tb_h + XT["inside"])], 0.5, closed=True)
+        tb_y0 = r1 if plain else ty
+        P.poly([(tx, tb_y0), (tx + tb_w, tb_y0), (tx + tb_w, ty + tb_h + XT["inside"]), (tx, ty + tb_h + XT["inside"])], 0.5, closed=True)
         for y in (r1, r2, r3):
             P.line(tx, y, tx + tb_w, y, 0.25)
         for f, ya, yb in ((0.61, r1, r2), (0.78, r1, r2), (0.30, r2, r3), (0.52, r2, r3), (0.78, r2, r3), (0.89, r2, r3), (0.39, r3, ty + tb_h), (0.56, r3, ty + tb_h),
                           (0.67, r3, ty + tb_h), (0.81, r3, ty + tb_h)):
             P.line(X(f), ya, X(f), yb, 0.25)
 
-        def cell(f, f2, y, label, value, size=2.8, bold=False):
-            P.text(X(f) + 1.5, y + 2, label, 1.7, grey=True)
+        def cell(f, f2, y, label, value, size=3.5, bold=False):
+            P.text(X(f) + 1.5, y + 2, label, 1.8, grey=True)
             room = tb_w * (f2 - f) - 3
             P.text(X(f) + 1.5, y + 5.5, value, max(1.4, min(size, room / max(text_width(value, bold), 1e-6))), bold=bold)
-        P.text(tx + 2, ty + 2.6, TX["disclaimer"], 1.8, grey=True)
-        P.text(tx + 2, ty + 5.2, TX["generated"].format(brand=brand or "Blender", file=SPEC.get("file") or "—"), 1.8, grey=True)
-        P.text(X(0) + 1.5, r1 + 2, TX["TITLE"], 1.7, grey=True)
+        if not plain:
+            P.text(tx + 2, ty + 2.6, TX["disclaimer"], 1.8, grey=True)
+            P.text(tx + 2, ty + 5.2, TX["generated"].format(brand=brand or "Blender", file=SPEC.get("file") or "—"), 1.8, grey=True)
+        P.text(X(0) + 1.5, r1 + 2, TX["TITLE"], 1.8, grey=True)
         tt = f"{title} — {g['label']}" if g["label"] else title
-        P.text(X(0) + 1.5, r1 + 8, tt, 5 if text_width(tt) * 5 < tb_w * 0.58 else 3.5 if text_width(tt) * 3.5 < tb_w * 0.58 else 2.6, bold=True)
-        P.text(X(0.61) + 1.5, r1 + 2, TX["PROJECTION"], 1.7, grey=True)
+        P.text(X(0) + 1.5, r1 + 8, tt, 5 if text_width(tt) * 5 < tb_w * 0.58 else 3.5 if text_width(tt) * 3.5 < tb_w * 0.58 else 2.5, bold=True)
+        P.text(X(0.61) + 1.5, r1 + 2, TX["PROJECTION"], 1.8, grey=True)
         angle_symbol(P, X(0.61) + 7.5, r1 + 6.6, third)
-        P.text(X(0.695), r1 + 11.7, TX["third" if third else "first"], 1.6, "center", grey=True)
+        P.text(X(0.695), r1 + 11.7, TX["third" if third else "first"], 1.8, "center", grey=True)
         bw = tb_w * 0.22 - 3
         if logo:
             P.image(X(0.78) + 1.5, r1 + 1, bw, 11 if not brand else 8, logo)
@@ -1080,7 +1442,7 @@ def run(SPEC, OUT, progress=None):
         cell(0.52, 0.78, r2, TX["FILE"], SPEC.get("file") or "—")
         cell(0.78, 0.89, r2, TX["UNIT"], f"{unit} [{unit2}]" if unit2 else unit)
         cell(0.89, 1, r2, TX["REV"], (XT["revs"][-1][0] if XT["revs"] and XT["revs"][-1][0] else SPEC.get("rev")) or "—", 3.5, True)
-        cell(0, 0.39, r3, TX["NUMBER"], number)
+        cell(0, 0.39, r3, TX["NUMBER"], number, 3.5, True)
         cell(0.39, 0.56, r3, TX["SCALE"], "—" if only_persp else planlayout.label(scale), 3.5, True)
         cell(0.56, 0.67, r3, TX["SIZE"], sheet)
         cell(0.67, 0.81, r3, TX["SHEET"], f"{n}/{len(jobs)}")
@@ -1098,6 +1460,27 @@ def run(SPEC, OUT, progress=None):
         if XT["owner"]:
             P.line(tx, y, tx + tb_w, y, 0.25)
             P.text(tx + 2, y + 3.1, XT["owner"], max(1.2, min(1.8, (tb_w - 4) / max(text_width(XT["owner"]), 1e-6))), grey=True)
+        if pg.get("annex"):
+            first = pg is next(p for gg, p in jobs if gg is g and p.get("annex"))
+            cw = pg["annex_w"]
+            for cx0, crows in pg["annex"]:
+                top = m + planlayout.BAND + 6
+                P.text(cx0, top - 2, TX["BOM"] if first else TX["annex_cont"], 2.5, bold=True)
+                yb = top + (len(crows) + 1) * REV_ROW
+                P.poly([(cx0, top), (cx0 + cw, top), (cx0 + cw, yb), (cx0, yb)], 0.35, closed=True)
+                cols = (0, 0.1, 0.86, 1)
+                for f in cols[1:3]:
+                    P.line(cx0 + cw * f, top, cx0 + cw * f, yb, 0.18)
+                for i, r in enumerate([(TX["ITEM"], TX["PART"], TX["QTY"])] + crows):
+                    yy = top + i * REV_ROW
+                    if i:
+                        P.line(cx0, yy, cx0 + cw, yy, 0.35 if i == 1 or r[1] == TX["TOTAL"] and not r[0] else 0.18)
+                    for c, t in enumerate(r):
+                        room = cw * (cols[c + 1] - cols[c]) - 3
+                        sz = 1.8 if not i else max(1.2, min(2.5, room / max(text_width(t), 1e-6)))
+                        P.text(cx0 + cw * cols[c] + 1.5, yy + 3.1, t, sz, grey=not i, bold=bool(i) and (c == 2 or not r[0]))
+            sheets.append(P)
+            continue
         yb = ty - planlayout.NOTES - 1
         if XT["revs"]:
             top = yb - (len(XT["revs"]) + 1) * REV_ROW
@@ -1111,33 +1494,36 @@ def run(SPEC, OUT, progress=None):
                     P.line(tx, yy, tx + tb_w, yy, 0.2)
                 for c, t in enumerate(r):
                     room = tb_w * (cols[c + 1] - cols[c]) - 3
-                    sz = 1.7 if not i else max(1.2, min(2.2, room / max(text_width(t), 1e-6)))
+                    sz = 1.8 if not i else max(1.2, min(2.5, room / max(text_width(t), 1e-6)))
                     P.text(X(cols[c]) + 1.5, yy + 3.1, t, sz, grey=not i, bold=bool(i) and c == 0)
             yb = top - 4
-        if g["bom"]:
+        if g["bom"] and g["annex"]:
+            na = next(i for i, (gg, p) in enumerate(jobs, 1) if gg is g and p.get("annex"))
+            P.text(tx, yb - 2.5, TX["annex_see"].format(n=na), 2.5, bold=True)
+            yb -= 7
+        elif g["bom"]:
             rows = [(str(i), k, str(q)) for i, (k, q) in enumerate(g["bom"][:BOM_MAX], 1)]
             if len(g["bom"]) > BOM_MAX:
                 rest = g["bom"][BOM_MAX:]
                 rows.append(("", TX["more"].format(n=len(rest)), str(sum(q for _, q in rest))))
             rows.append(("", TX["TOTAL"], str(sum(q for _, q in g["bom"]))))
             top = yb - (len(rows) + 1) * REV_ROW
-            P.text(tx, top - 2, TX["BOM"], 2.2, bold=True)
+            P.text(tx, top - 2, TX["BOM"], 2.5, bold=True)
             P.poly([(tx, top), (tx + tb_w, top), (tx + tb_w, yb), (tx, yb)], 0.35, closed=True)
             cols = (0, 0.1, 0.86, 1)
             for f in cols[1:3]:
-                P.line(X(f), top, X(f), yb, 0.2)
+                P.line(X(f), top, X(f), yb, 0.18)
             for i, r in enumerate([(TX["ITEM"], TX["PART"], TX["QTY"])] + rows):
-                yy = top + i * REV_ROW
-                if i:
-                    P.line(tx, yy, tx + tb_w, yy, 0.35 if i == len(rows) else 0.2)
+                yy = yb - (i + 1) * REV_ROW
+                P.line(tx, yy, tx + tb_w, yy, 0.35 if i in (0, len(rows) - 1) else 0.18)
                 for c, t in enumerate(r):
                     room = tb_w * (cols[c + 1] - cols[c]) - 3
-                    sz = 1.7 if not i else max(1.2, min(2.2, room / max(text_width(t), 1e-6)))
+                    sz = 1.8 if not i else max(1.2, min(2.5, room / max(text_width(t), 1e-6)))
                     P.text(X(cols[c]) + 1.5, yy + 3.1, t, sz, grey=not i, bold=bool(i) and (c == 2 or i == len(rows)))
             yb = top - 5
         if XT["legend"]:
             top = yb - (len(XT["legend"]) + 1) * REV_ROW
-            P.text(tx, top - 2, TX["LEGEND"], 2.2, bold=True)
+            P.text(tx, top - 2, TX["LEGEND"], 2.5, bold=True)
             P.poly([(tx, top), (tx + tb_w, top), (tx + tb_w, yb), (tx, yb)], 0.35, closed=True)
             cols = (0, 0.18, 1)
             P.line(X(cols[1]), top, X(cols[1]), yb, 0.2)
@@ -1147,25 +1533,48 @@ def run(SPEC, OUT, progress=None):
                     P.line(tx, yy, tx + tb_w, yy, 0.2)
                 for c, tt in enumerate(r):
                     room = tb_w * (cols[c + 1] - cols[c]) - 3
-                    sz = 1.7 if not i else max(1.2, min(2.2, room / max(text_width(tt), 1e-6)))
+                    sz = 1.8 if not i else max(1.2, min(2.5, room / max(text_width(tt), 1e-6)))
                     P.text(X(cols[c]) + 1.5, yy + 3.1, tt, sz, grey=not i, bold=bool(i) and c == 0)
+            yb = top - 5
+        if XT["tol"]:
+            vals = ISO2768[XT["tol"]]
+            used = [i for i, (lo, hi) in enumerate(ISO2768_RANGES) if vals[i] is not None and any(lo <= x <= hi for x in DIMV)]
+            used = used or [i for i in range(len(ISO2768_RANGES)) if vals[i] is not None]
+            num = lambda x: f"{x:g}".replace(".", ",") if lang == "fr" else f"{x:g}"
+            rows = [(TX["tol_size"], *(f"{num(ISO2768_RANGES[i][0])}–{num(ISO2768_RANGES[i][1])}" for i in used)),
+                    (TX["tol_dev"], *(f"±{num(vals[i])}" for i in used))]
+            top = yb - 2 * REV_ROW
+            P.text(tx, top - 2, TX["tol_table"].format(c=XT["tol"]), 2.5, bold=True)
+            P.poly([(tx, top), (tx + tb_w, top), (tx + tb_w, yb), (tx, yb)], 0.35, closed=True)
+            cols = [0.18 + 0.82 * j / len(used) for j in range(len(used) + 1)]
+            cols = [0] + cols
+            for f in cols[1:-1]:
+                P.line(X(f), top, X(f), yb, 0.2)
+            P.line(tx, top + REV_ROW, tx + tb_w, top + REV_ROW, 0.2)
+            for i, r in enumerate(rows):
+                yy = top + i * REV_ROW
+                for c, tt in enumerate(r):
+                    room = tb_w * (cols[c + 1] - cols[c]) - 3
+                    sz = max(1.2, min(2.5 if c else 1.8, room / max(text_width(tt), 1e-6)))
+                    P.text(X(cols[c]) + 1.5, yy + 3.1, tt, sz, grey=not c, bold=bool(c) and i == 1)
             yb = top - 5
         if XT["rem"]:
             top = yb - 5 - len(XT["rem"]) * REM_LINE
-            P.text(tx, top + 2.5, TX["REMARKS"], 2.2, bold=True)
+            P.text(tx, top + 2.5, TX["REMARKS"], 2.5, bold=True)
             for i, t in enumerate(XT["rem"]):
                 P.text(tx, top + 5 + (i + 0.75) * REM_LINE, t, REM_SIZE)
-        P.text(tx, ty - 8.5, TX["dims"].format(u=UNITS[unit][1] + (f" [{UNITS[unit2][1]}]" if unit2 else ""), a=dual(real.x), b=dual(real.y), c=dual(real.z)), 2, grey=True)
-        wlo, whi = lo * unit_mm, hi * unit_mm
-        P.text(tx, ty - 5.5, TX["origin"] + " · ".join(TX["range"].format(a=a, lo=fmt(wlo[i] + 0, 1 if unit == "mm" else None), hi=fmt(whi[i] + 0, 1 if unit == "mm" else None)) for i, a in enumerate("XYZ")), 2, grey=True)
-        if hidden:
-            P.text(tx, ty - 2.5, TX["hidden"] + (TX["hidden_main"] if g["trimmed"] else ""), 2, grey=True)
+        if not plain:
+            P.text(tx, ty - 8.5, TX["dims"].format(u=UNITS[unit][1] + (f" [{UNITS[unit2][1]}]" if unit2 else ""), a=dual(real.x), b=dual(real.y), c=dual(real.z)), 1.8, grey=True)
+            wlo, whi = lo * unit_mm, hi * unit_mm
+            P.text(tx, ty - 5.5, TX["origin"] + " · ".join(TX["range"].format(a=a, lo=fmt(wlo[i] + 0, 1 if unit == "mm" else None), hi=fmt(whi[i] + 0, 1 if unit == "mm" else None)) for i, a in enumerate("XYZ")), 1.8, grey=True)
+            if hidden:
+                P.text(tx, ty - 2.5, TX["hidden"] + (TX["hidden_main"] if g["trimmed"] else ""), 1.8, grey=True)
         if not only_persp:
             scale_bar(P, tx + tb_w - 5, ty - 5, scale, unit, lang)
         sheets.append(P)
     tell0(0.97, "PDF / SVG")
     os.makedirs(os.path.join(OUT, "out"), exist_ok=True)
-    name = (SPEC.get("name") or "plan").replace("/", "-")
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", SPEC.get("name") or "plan").strip(" .") or "plan"
     svgs = [f"{name}.svg"] if len(sheets) == 1 else [f"{name}-{i}.svg" for i in range(1, len(sheets) + 1)]
     for fn, P in zip(svgs, sheets):
         with open(os.path.join(OUT, "out", fn), "w", encoding="utf-8") as f:
@@ -1173,6 +1582,8 @@ def run(SPEC, OUT, progress=None):
     with open(os.path.join(OUT, "out", f"{name}.pdf"), "wb") as f:
         f.write(pdf(sheets))
     files = [f"{name}.pdf"] + svgs
+    for write in EXTRA_OUTPUTS:
+        files += write(sheets, os.path.join(OUT, "out"), name)
     return {"files": files, "sizes": {fn: os.path.getsize(os.path.join(OUT, "out", fn)) for fn in files}, "steps": steps, "warnings": warnings, "infos": infos,
             "scale": G[0]["scale"], "size_mm": [round(v, 1) for v in G[0]["real"]], "objects": sum(g["objects"] for g in G),
             "seconds": round(time.time() - t0, 1),

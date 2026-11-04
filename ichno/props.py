@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ichno: scene settings
 import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
@@ -55,6 +57,17 @@ class IchnoSettings(bpy.types.PropertyGroup):
     fast: BoolProperty(name="Fast", description="About a third faster on heavy models: back faces ignored and no intersection lines "
                        "(lines missing on open surfaces seen from behind and where two objects cross); for drafts", default=False)
     axes: BoolProperty(name="Axes", description="Small X, Y, Z axis triad next to each view title", default=True)
+    standard: EnumProperty(name="Standard", description="Drawing rules that differ between ISO and ASME: dimension text, arrows, "
+                           "extension line gap, filing margin, tolerance label", items=[
+        ("auto", "Auto", "ISO with the European projection, ASME with the American one"),
+        ("iso", "ISO", "ISO 128, 129-1, 5457: dimension text above the line, read from the bottom or the right"),
+        ("asme", "ASME", "ASME Y14.5, Y14.1: dimension text horizontal, in a break of the line")], default="auto")
+    filing_margin: BoolProperty(name="Filing Margin", description="20 mm margin on the left side for binding (ISO 5457)", default=True)
+    view_titles: BoolProperty(name="View Titles", description="Name and scale above each view; workshops usually leave them out, "
+                              "the projection identifies the views (ISO 128-3)", default=True)
+    dims_all: BoolProperty(name="Overall Dimensions on Every View", description="Width and height on every view. Off: each dimension "
+                           "only once, width and height on the front view, depth on the side view (ISO 129-1)", default=False)
+    chain_ticks: BoolProperty(name="Architect Ticks", description="Oblique ticks instead of arrows at the ends of chain dimensions", default=False)
     weight: EnumProperty(name="Line weight", items=[("fine", "Fine", ""), ("normal", "Normal", ""), ("bold", "Bold", "")], default="normal")
     angle: FloatProperty(name="Crease angle", description="Edges sharper than this are drawn", default=30, min=1, max=179, precision=0, step=500)
     title: StringProperty(name="Title")
@@ -71,8 +84,25 @@ class IchnoSettings(bpy.types.PropertyGroup):
     legend: CollectionProperty(type=titleblock.IchnoAbbr)
     legend_index: IntProperty()
     remarks: PointerProperty(name="Remarks", description="Text (Text Editor) written above the title block", type=bpy.types.Text)
+    checked: StringProperty(name="Checked", description="Who checked the drawing")
+    approved: StringProperty(name="Approved", description="Who approved the drawing")
+    tolerances: EnumProperty(name="General Tolerances", description="General tolerances for dimensions without their own tolerance", items=[
+        ("none", "None", "", 0), ("ISO 2768", "ISO 2768", "Linear and angular class, geometrical class", 1),
+        ("ISO 22081", "ISO 22081", "Default geometrical specification", 6), ("custom", "Custom", "Your own text", 7)], default="none")
+    tol_class: EnumProperty(name="Class", description="ISO 2768-1: tolerance class of linear and angular dimensions", items=[
+        ("f", "f", "Fine class"), ("m", "m", "Medium class"), ("c", "c", "Coarse class"), ("v", "v", "Very coarse class")], default="m")
+    tol_geo: EnumProperty(name="Geometrical", description="ISO 2768-2: tolerance class of straightness, flatness, perpendicularity, symmetry, run-out",
+                          items=[("none", "–", "No geometrical class"), ("H", "H", "Fine class"), ("K", "K", "Medium class"),
+                                 ("L", "L", "Coarse class")], default="none")
+    tol_envelope: BoolProperty(name="Envelope Requirement (E)", description="Features of size must fit a perfect form at maximum material size")
+    tol_table: BoolProperty(name="Table of Deviations", description="Table above the title block with the permitted deviations (± mm) "
+                            "of the class, for the sizes dimensioned on the sheet")
+    tolerances_text: StringProperty(name="Tolerances", description="e.g. ±0.5, X.X = ±0.1, ANGLES ±1°")
+    material: StringProperty(name="Material", description="Material, finish")
     owner: StringProperty(name="Ownership", description="Ownership notice at the bottom of the title block, e.g. “This drawing is the property of … — all rights reserved”")
     folder: StringProperty(name="Folder", subtype="DIR_PATH", default="//plan/")
+    subfolder: BoolProperty(name="Folder per Drawing", default=True,
+                            description="Put all the files of the drawing (PDF, SVG…) in a folder named after the drawing number, inside Folder")
     open_pdf: BoolProperty(name="Open PDF", description="Open the PDF when the plan is done", default=True)
     use_sheets: BoolProperty(name="Sheets by Collection", description="One sheet per group of collections, each with its name and scale")
     sheets: CollectionProperty(type=sheets.IchnoSheet)
@@ -91,6 +121,11 @@ class IchnoSettings(bpy.types.PropertyGroup):
         ("collection", "Collection", "One row per collection"), ("property", "Custom Property", "One row per value of a custom property")],
         default="none")
     bom_prop: StringProperty(name="Property", description="Custom property of the objects (Object Properties > Custom Properties)", default="ref")
+    bom_annex: EnumProperty(name="Separate Sheet", description="Bill of materials on its own sheet at the end of the drawing", items=[
+        ("auto", "Auto", "When it has more than 30 rows"), ("always", "Always", ""), ("never", "Never", "Always above the title block, rows past 30 summed up")],
+        default="auto")
+    bom_cols: CollectionProperty(type=sheets.IchnoSheetCollection)
+    bom_col_index: IntProperty()
     chains: CollectionProperty(type=chains.IchnoChain)
     chain_index: IntProperty()
 

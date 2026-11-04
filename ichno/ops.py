@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ichno: Make Plan: runs the drawing in a background Blender
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,10 +15,18 @@ import bpy
 
 from .i18n import drawing_lang, rpt, tr
 from . import chains, titleblock
-from .sheets import objects_to_draw, problems, sheet_objects, sheet_views
+from .sheets import bom_objects, objects_to_draw, problems, sheet_objects, sheet_views
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _job = {}
+
+
+def tol_text(s):
+    if s.tolerances == "ISO 2768":
+        return "ISO 2768-" + s.tol_class + (s.tol_geo if s.tol_geo != "none" else "") + ("-(E)" if s.tol_envelope else "")
+    if s.tolerances == "custom":
+        return s.tolerances_text
+    return s.tolerances if s.tolerances == "ISO 22081" else ""
 
 
 def output_folder(s):
@@ -90,8 +101,18 @@ def start(context):
     if s.iso_view == "viewport" and r3d:
         q = r3d.view_rotation
         spec["iso_dir"], spec["iso_up"] = list(q @ Vector((0, 0, -1))), list(q @ Vector((0, 1, 0)))
+    std = s.standard if s.standard != "auto" else ("asme" if s.projection == "third" else "iso")
+    spec.update({"standard": std, "filing": s.filing_margin and std == "iso", "view_titles": s.view_titles, "dims_all": s.dims_all,
+                 "chain_ticks": s.chain_ticks, "checked": s.checked, "approved": s.approved, "material": s.material,
+                 "tolerances": tol_text(s), "tol_table": s.tol_class if s.tolerances == "ISO 2768" and s.tol_table else ""})
     if s.bom_by != "none":
-        spec["bom"] = {"by": s.bom_by, "prop": s.bom_prop}
+        spec["bom"] = {"by": s.bom_by, "prop": s.bom_prop, "annex": s.bom_annex}
+        only = bom_objects(s, set(names))
+        if only is not None:
+            if not only:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return rpt("Bill of Materials: {}", tr("nothing to count (check its collections)"))
+            spec["bom"]["only"] = only
     spec["views"] = [k for k in ("front", "side", "top") if getattr(s, "view_" + k)]
     spec["chains"] = chains.spec(s, set(names))
     spec.update(titleblock.spec(s))
@@ -100,11 +121,17 @@ def start(context):
                         "origin": list(s.grid_origin.matrix_world.translation) if s.grid_origin else [0, 0, 0]}
     if s.use_sheets and s.sheets:
         shown = set(names)
-        spec["sheets"] = [{"name": sh.name, "only": sheet_objects(sh, shown), "views": sheet_views(sh)} for sh in s.sheets]
+        spec["sheets"] = [{"name": sh.name, "only": sheet_objects(sh, shown), "views": sheet_views(sh), "bom": sh.show_bom} for sh in s.sheets]
         empty = [sh["name"] for sh in spec["sheets"] if not sh["only"]]
         if empty:
             shutil.rmtree(tmp, ignore_errors=True)
             return rpt("Sheet “{}”: {}", empty[0], tr("nothing to draw (check Objects)"))
+    pro = getattr(context.scene, "ichno_pro", None)
+    if pro:
+        spec["dxf"], spec["dxf_real"], spec["bom_files"] = pro.dxf, pro.dxf_real, pro.bom_files
+        spec["manual_dims"] = [{"a": list(d.a), "b": list(d.b), "view": d.view.lower()} for d in pro.dims]
+        if pro.balloons != "NONE" and s.bom_by != "none":
+            spec["balloons"] = {"views": [pro.balloons.lower()]}
     with open(os.path.join(tmp, "spec.json"), "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False)
     cmd = [bpy.app.binary_path, "-b", blend, "--factory-startup", "--disable-autoexec", "-noaudio",
@@ -112,7 +139,10 @@ def start(context):
     out = os.path.join(tmp, "output.txt")
     with open(out, "wb") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
-    _job.update(proc=proc, tmp=tmp, out=out, pos=0, log=[], cancel=False, folder=output_folder(s), open=s.open_pdf)
+    folder = output_folder(s)
+    if s.subfolder:
+        folder = os.path.join(folder, re.sub(r'[<>:"/\\|?*]+', "-", spec["name"]).strip(" .") or "plan")
+    _job.update(proc=proc, tmp=tmp, out=out, pos=0, log=[], cancel=False, folder=folder, open=s.open_pdf)
     job.running, job.progress, job.message = True, 0, tr("Starting…")
     return None
 
@@ -211,7 +241,7 @@ class ICHNO_OT_make(bpy.types.Operator):
         context.window_manager.ichno_job.last = res["pdf"]
         if _job["open"]:
             bpy.ops.wm.path_open(filepath=res["pdf"])
-        n = len(res["files"]) - 1
+        n = sum(fn.endswith(".svg") for fn in res["files"])
         return self.finish(context, tr("{} sheets in {} s" if n > 1 else "{} sheet in {} s", n, res.get("seconds", 0)))
 
     def finish(self, context, msg):
@@ -257,5 +287,11 @@ def register():
 def unregister():
     if _job.get("proc"):
         _job["proc"].kill()
+        try:
+            _job["proc"].wait(5)
+        except subprocess.TimeoutExpired:
+            pass
+    shutil.rmtree(_job.get("tmp", ""), ignore_errors=True)
+    _job.clear()
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)

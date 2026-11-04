@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Ichno: sheets by collection
 import bpy
 
 from .i18n import rpt, tr
@@ -57,6 +59,7 @@ class IchnoSheet(bpy.types.PropertyGroup):
     view_side: BoolProperty(name="Side", default=True)
     view_top: BoolProperty(name="Top", default=True)
     view_iso: BoolProperty(name="Isometric", default=True)
+    show_bom: BoolProperty(name="Bill of Materials", description="This sheet shows the bill of materials", default=True)
 
 
 VIEW_KEYS = ("front", "side", "top", "iso")
@@ -248,8 +251,57 @@ def draw(layout, s, context):
         r.label(text=tr("Sheet “{}”: {}", s.sheets[i].name, why), icon="ERROR", translate=False)
 
 
+class ICHNO_OT_bom_col_add(bpy.types.Operator):
+    """Add a collection to the bill of materials"""
+    bl_idname = "ichno.bom_col_add"
+    bl_label = "Add Collection"
+    bl_options = {"UNDO"}
+
+    def execute(self, context):
+        s = settings(context)
+        s.bom_cols.add()
+        s.bom_col_index = len(s.bom_cols) - 1
+        return {"FINISHED"}
+
+
+class ICHNO_OT_bom_col_remove(bpy.types.Operator):
+    """Remove the collection from the bill of materials"""
+    bl_idname = "ichno.bom_col_remove"
+    bl_label = "Remove Collection"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return len(settings(context).bom_cols) > 0
+
+    def execute(self, context):
+        s = settings(context)
+        s.bom_cols.remove(s.bom_col_index)
+        s.bom_col_index = max(0, min(s.bom_col_index, len(s.bom_cols) - 1))
+        return {"FINISHED"}
+
+
+def bom_objects(s, shown):
+    cols = [c.collection for c in s.bom_cols if c.collection]
+    return sorted({o.name for c in cols for o in c.all_objects} & shown) if cols else None
+
+
+def draw_bom_cols(layout, s):
+    layout.label(text="Collections counted (all if empty)")
+    row = layout.row()
+    row.template_list("ICHNO_UL_sheet_collections", "bom", s, "bom_cols", s, "bom_col_index", rows=2)
+    col = row.column(align=True)
+    col.operator("ichno.bom_col_add", icon="ADD", text="")
+    col.operator("ichno.bom_col_remove", icon="REMOVE", text="")
+    if s.use_sheets and s.sheets:
+        layout.label(text="Shown on sheets")
+        flow = layout.grid_flow(columns=2, even_columns=True, align=True)
+        for sh in s.sheets:
+            flow.prop(sh, "show_bom", text=sh.name, translate=False)
+
+
 DATA = (IchnoSheetCollection, IchnoSheet)
-CLASSES = (ICHNO_UL_sheets, ICHNO_UL_sheet_collections, ICHNO_OT_sheet_add, ICHNO_OT_sheet_remove, ICHNO_OT_sheet_move, ICHNO_OT_sheet_auto,
+CLASSES = (ICHNO_UL_sheets, ICHNO_UL_sheet_collections, ICHNO_OT_bom_col_add, ICHNO_OT_bom_col_remove, ICHNO_OT_sheet_add, ICHNO_OT_sheet_remove, ICHNO_OT_sheet_move, ICHNO_OT_sheet_auto,
            ICHNO_OT_sheet_col_add, ICHNO_OT_sheet_col_remove)
 
 
