@@ -62,7 +62,7 @@ The drawing is computed by a second Blender in the background, from a copy of yo
 ## Roadmap
 A new version every two weeks. Target dates, they may change.
 
-![Ichno roadmap: 1.0.6 on Nov 8, 1.0.7 on Nov 22, 1.0.8 on Dec 6, 1.0.9 Japan on Dec 20, more countries in 2027](images/roadmap.png)
+![Ichno roadmap: 1.0.6 on Nov 8, 1.0.7 on Nov 22, 1.0.8 on Dec 6, 1.0.9 Japan on Dec 20, more countries in 2027](images/ichno-roadmap-free.png)
 
 - **1.0.6 (Nov 8)**: ISO 2768 general tolerances with a table of deviations, ISO small dimensions, F1 help, SVG layers
 - **1.0.7 (Nov 22)**: manual and angle dimensions, notes with leaders, dimension styles
