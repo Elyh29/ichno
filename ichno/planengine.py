@@ -1270,9 +1270,13 @@ def run(SPEC, OUT, progress=None):
         st = sorted({round(X(a), 3) for a, _, _, _ in segs} | {round(X(b), 3) for _, b, _, _ in segs})
         P.line(st[0], y, st[-1], y, W["detail"])
         if ch["pos"]:
-            for x, w in ch["world"].items():
+            last = None
+            for x, w in sorted(ch["world"].items(), key=lambda it: X(it[0])):
                 t = fmt(w + 0, 1 if unit == "mm" else None)
                 size = max(1.1, min(1.6, (POS_ROW - 2) / max(text_width(t), 1e-6)))
+                if last is not None and X(x) - last < size * 1.1:
+                    continue
+                last = X(x)
                 P.text(X(x) + size * 0.45, y + 1.8 + text_width(t) * size / 2, t, size, "center", rot=True)
             P.text(st[0] - 1.5, y + 3, ch["axis"], 1.8, "right", bold=True)
         AL, s2 = ARROW
@@ -1288,7 +1292,8 @@ def run(SPEC, OUT, progress=None):
                 P.tri([(px, y), (px + sg * AL * math.cos(s2), y - AL * math.sin(s2)), (px + sg * AL * math.cos(s2), y + AL * math.sin(s2))])
         for x in ticks:
             P.line(x - 0.9, y + 0.9, x + 0.9, y - 0.9, 0.25)
-        for a, b, n, d in segs:
+        lastv = None
+        for a, b, n, d in sorted(segs, key=lambda sg: X(sg[0])):
             xa, xb = X(a), X(b)
             t = f"{n} × {dual(d)} = {dual(d * n)}" if n > 1 else dual(d)
             if text_width(t) * 2.5 <= (xb - xa) - 1:
@@ -1298,7 +1303,12 @@ def run(SPEC, OUT, progress=None):
                 if text_width(t) * 1.4 > room:
                     t = f"{n} × {fmt(d)}" if n > 1 else fmt(d)
                 size = max(1.1, min(1.8, room / max(text_width(t), 1e-6)))
-                P.text((xa + xb) / 2 + size * 0.45, y - 1 - text_width(t) * size / 2, t, size, "center", rot=True)
+                xc = (xa + xb) / 2
+                if lastv is not None and xc - lastv < size * 1.1:
+                    P.line(xc, y - 0.3, lastv + size * 1.1, y - 0.9, 0.13)
+                    xc = lastv + size * 1.1
+                lastv = xc
+                P.text(xc + size * 0.45, y - 1 - text_width(t) * size / 2, t, size, "center", rot=True)
 
     def grid_of(P, v, gr, ex):
         X = lambda x: v["x"] + (x - ex[0]) * k_paper
@@ -1360,8 +1370,11 @@ def run(SPEC, OUT, progress=None):
             frame(P, sw, sh)
         tb_x0 = sw - m - min(planlayout.TB_W, sw - 2 * m)
         tb_top = sh - m - planlayout.TB_H - XT["inside"] - planlayout.NOTES - XT["above"] - bom_height(g["bom"], g["annex"]) - 3
-        P.text(sw / 2, m + 7, title.upper(), 5, "center", bold=True)
-        sub = f"{g['label']} · {project}" if g["label"] else project
+        notitle = title == "—" and g["label"]
+        P.text(sw / 2, m + 7, (g["label"] if notitle else title).upper(), 5, "center", bold=True)
+        sub = project if notitle else f"{g['label']} · {project}" if g["label"] else project
+        if sub.endswith(" · —"):
+            sub = sub[:-4]
         if pg.get("annex"):
             sub = TX["BOM"] + (f" · {sub}" if sub != "—" else "")
         if pg.get("planes"):
@@ -1370,7 +1383,10 @@ def run(SPEC, OUT, progress=None):
             pg["views"] = [{"name": "Perspective", "x": x, "y": y, "w": w, "h": h, "plane": i, "ext": ex}
                            for i, (x, y, w, h) in enumerate(plansection.plane_cells(len(drawn["Perspective"]["planes"]), (ex[1] - ex[0]) / max(ex[3] - ex[2], 1e-9),
                                                                         planlayout.zones(sw, sh)[0], tb_x0, tb_top, planlayout.TOP))]
-        P.text(sw / 2, m + 13, sub, 3.5, "center")
+        if sub == "—" and notitle:
+            sub = ""
+        if sub:
+            P.text(sw / 2, m + 13, sub, 3.5, "center")
         only_persp = all(v["name"] == "Perspective" for v in pg["views"])
         here = [v["name"] for v in pg["views"] if v["name"] in drawn and v["name"] != "Perspective"]
         own = set()
@@ -1472,7 +1488,7 @@ def run(SPEC, OUT, progress=None):
                 TX["generated"].format(brand=tool and f"{tool} (Blender {bpy.app.version_string})" or brand or "Blender", file=SPEC.get("file") or "—")
             P.text(tx + 2, ty + 5.2, gen, 1.8, grey=True)
         P.text(X(0) + 1.5, r1 + 2, TX["TITLE"], 1.8, grey=True)
-        tt = f"{title} — {g['label']}" if g["label"] else title
+        tt = g["label"] if notitle else f"{title} — {g['label']}" if g["label"] else title
         P.text(X(0) + 1.5, r1 + 8, tt, 5 if text_width(tt) * 5 < tb_w * 0.58 else 3.5 if text_width(tt) * 3.5 < tb_w * 0.58 else 2.5, bold=True)
         P.text(X(0.61) + 1.5, r1 + 2, TX["PROJECTION"], 1.8, grey=True)
         angle_symbol(P, X(0.61) + 7.5, r1 + 6.6, third)

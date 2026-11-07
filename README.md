@@ -42,7 +42,9 @@ Right-click any Ichno setting ‣ **Online Manual** (F1) opens its page in the [
 - Optional page with one isometric view per plane, cut or whole
 - Coloured planes (A red, B blue, C green…) or plain black and white ISO
 
-![Section views: cutting plane placed in the 3D View with a live hatched preview, and the ISO 128 section A–A on the drawing](images/coming-section-views.png)
+![Section views: cutting plane placed in the 3D View with a live hatched preview, and the ISO 128 sections A–A and B–B on the drawing](images/section-views.png)
+
+![Cutting planes page: one isometric view per plane, cut, in the colour of its section](images/cutting-planes.png)
 
 ### Dimensions and tolerances
 - **ISO or ASME** dimensioning: text placement, arrowheads and extension lines follow each standard
