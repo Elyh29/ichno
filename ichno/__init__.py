@@ -9,14 +9,14 @@ import bpy
 for _name in [n for n in sys.modules if n.startswith(__name__ + ".")]:
     del sys.modules[_name]
 
-from . import chains, help, i18n, ops, props, section, sheets, titleblock, ui
+from . import chains, dims, edges, help, i18n, ops, props, section, sheets, titleblock, ui, viewer
 
 try:
     from . import pro
 except ImportError:
     pro = None
 
-MODULES = (pro,) * bool(pro) + (i18n, props, sheets, chains, titleblock, section, ops, ui, help)
+MODULES = (pro,) * bool(pro) + (i18n, props, sheets, chains, dims, edges, titleblock, section, ops, ui, viewer, help)
 
 
 __copyright__ = "Copyright (C) 2026 Ely (Ichno)"

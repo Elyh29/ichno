@@ -4,13 +4,39 @@
 # Ichno: chain dimensions settings and panel
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty
+from mathutils import Vector
+
+from .i18n import tr
+
+SIDES = {(0, 1): "Right (+X)", (0, -1): "Left (-X)", (1, 1): "Back (+Y)", (1, -1): "Front (-Y)", (2, 1): "Top (+Z)", (2, -1): "Bottom (-Z)"}
+_items = []
+
+
+def side_name(w):
+    i = max(range(3), key=lambda k: abs(w[k]))
+    return SIDES[(i, 1 if w[i] > 0 else -1)]
+
+
+def _ref_items(self, context):
+    try:
+        from .section import view_dir
+        d = view_dir(context.scene, self.view)
+        up = view_dir(context.scene, "front") if self.view == "top" else Vector((0, 0, 1))
+        right = d.cross(up)
+        left_s, right_s = tr(side_name(-right)), tr(side_name(right))
+    except Exception:
+        left_s, right_s = tr("Left Edge"), tr("Right Edge")
+    items = [("min", left_s, tr("Edge on the left of the view on the sheet")), ("center", tr("Center"), ""),
+             ("max", right_s, tr("Edge on the right of the view on the sheet")), ("origin", tr("Origin"), "")]
+    _items[:] = items
+    return items
 
 
 class IchnoChain(bpy.types.PropertyGroup):
     collection: PointerProperty(name="Collection", type=bpy.types.Collection)
     view: EnumProperty(name="View", items=[("top", "Top", ""), ("front", "Front", ""), ("side", "Side", "")], default="top")
-    ref: EnumProperty(name="Reference", description="Point of each object used as a station", items=[
-        ("min", "Left Edge", ""), ("center", "Center", ""), ("max", "Right Edge", ""), ("origin", "Origin", "")], default="min")
+    ref: EnumProperty(name="Reference", description="Point of each object used as a station, named after the side of the model",
+                      items=_ref_items, default=0)
     tol: FloatProperty(name="Tolerance", description="Intervals that differ by less than this are merged into “n × pitch” (model imprecision)",
                        default=1, min=0, max=10, subtype="PERCENTAGE", precision=1)
     combine: BoolProperty(name="Combine Equal Spacing", description="Equal intervals in a row written once as “n × pitch = total”; "

@@ -5,7 +5,7 @@ Orthographic views, isometric view, section views, dimensions, title block and b
 
 *Featured on [BlenderNation](https://www.blendernation.com/2026/11/01/ichno-free-one-click-technical-drawings-from-blender-scenes/).*
 
-![Ichno: a Blender model turned into a dimensioned technical drawing with front, side, top and isometric views](images/00-cover.png)
+![Ichno: a Blender model turned into a dimensioned technical drawing with front, side, top and isometric views](images/free1.png)
 
 Ichno makes **blueprints and shop drawings** straight from Blender: furniture and woodworking plans, interior layouts,
 product and 3D printing parts, mechanical assemblies. The drawings are ready to print, to send to a client or a workshop,
@@ -58,9 +58,18 @@ Right-click any Ichno setting ‣ **Online Manual** (F1) opens its page in the [
 
 ![ISO 2768 general tolerances: table of deviations above the title block, ISO 2768-mK-(E) in the title block](images/coming-iso-2768.png)
 
+### Annotations
+- **Manual dimensions** between two vertices and **angle dimensions** from three (Edit Mode), drawn at true length on the views parallel to them
+- Symbols before the value: Ø, R, SØ, SR, □, t= (ISO 129-1)
+- **Hole dimensions**: `4 × Ø8` per diameter on a leader, spacing as chain dimensions, values taken from the model
+- **Centre lines** on holes and shafts (ISO 128-2), **45° chamfers** dimensioned `2 × 45°`
+- Overall size **without handles**: body size first, full size in brackets
+- **Marked edges**: edges you choose are always drawn, even on smooth surfaces
+- Edge condition (ISO 13715) in the title block
+
 ### Sheets, title block and bill of materials
 - A4 to A0, Letter, Tabloid, ANSI C and D, portrait or landscape
-- **One sheet per collection** in a single multi-page PDF, each with its own views and scale
+- **One sheet per collection** in a single multi-page PDF with one bookmark per sheet, each with its own views and scale
 - A fixed scale too large for one sheet: views spread over two sheets, or that sheet switches to automatic scale
 - Title block with company name and logo, drawing number, author, date, revision table, custom fields
 - Checked, Approved, **general tolerances** (ISO 2768, ISO 22081 or custom) and material
@@ -69,7 +78,9 @@ Right-click any Ichno setting ‣ **Online Manual** (F1) opens its page in the [
 - Abbreviation legend, remarks and ownership notice
 
 ### Practical
-- **SVG with layers** (VISIBLE, HIDDEN, DIMENSIONS, TEXT, FRAME) to filter in Illustrator, Inkscape or a viewer
+- **Viewer inside Blender**: the drawing sheet by sheet, thumbnails, layers on/off, save a sheet as PNG
+- **SVG with layers** (VISIBLE, HIDDEN, DIMENSIONS, TEXT, FRAME): Inkscape layers, named groups in Illustrator and Affinity, optional layer colours
+- With the free **Talos** add-on (fasteners): screws, nuts and washers drawn from their description, holes dimensioned in full (⌴ ⌵ ↧, threads ISO 6410-1), full designations in the bill of materials
 - Linked and instanced collections drawn and counted as one part
 - Fast mode for drafts of heavy models
 - Interface and drawings in English and French
@@ -82,11 +93,8 @@ Right-click any Ichno setting ‣ **Online Manual** (F1) opens its page in the [
 ## Roadmap
 Each version ships **when it is ready**, no fixed dates; the order may change.
 
-![Ichno roadmap: 1.0.6 now, then dimensions and holes, notes and views, Japan, then more countries](images/ichno-roadmap-free.png)
-
-- **Now — 1.0.6**: section views with ISO hatching, ISO 2768 tolerances with a table of deviations, ISO small dimensions, F1 help, SVG layers
-- **Next — 1.0.7**: manual and angle dimensions, Ø, R and □ symbols, hole dimensions and spacing, centre lines, chamfers “C2”, the drawing viewed inside Blender
-- **Then — 1.0.8**: notes with leaders, dimension styles, revision table, views from a camera, shaded views, edge conditions, material colours on the drawing
+- **Now — 1.0.7**: manual and angle dimensions, Ø, R and □ symbols, hole dimensions and spacing, centre lines, 45° chamfers, the drawing viewed inside Blender, Talos fasteners
+- **Next — 1.0.8**: notes with leaders, dimension styles, revision table, views from a camera, shaded views, material colours on the drawing
 - **Then — 1.0.9**: country setting, first national update for Japan (JIS standard, Japanese interface and drawings)
 - **Later**: more countries (DIN, GB/T, ASME Y14.1, Spanish, Portuguese) and more languages
 

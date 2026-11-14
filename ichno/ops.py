@@ -15,8 +15,10 @@ from mathutils import Vector
 
 import bpy
 
+HANDLE_WORDS = re.compile(r"handle|knob|pull\b|poign|bouton|griff|tirette|maniglia|pomo|tirador", re.I)
+
 from .i18n import drawing_lang, rpt, tr
-from . import chains, section, titleblock
+from . import chains, dims, section, titleblock
 from .sheets import bom_objects, objects_to_draw, problems, sheet_objects, sheet_views
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,7 +106,7 @@ def start(context):
     bpy.ops.wm.save_as_mainfile(filepath=blend, copy=True, check_existing=False)
     spec = {"only": names, "sheet": s.sheet, "land": s.landscape, "scale": s.scale or "auto",
             "proj": s.projection, "front": s.front, "unit": s.unit, "unit2": s.unit2 if s.unit2 != s.unit else "none", "author": s.author, "rev": s.revision, "logo": bpy.path.abspath(s.logo) if s.logo else "", "iso": s.iso, "hidden": s.hidden, "iso_hidden": s.iso_hidden, "axes": s.axes, "fast": s.fast,
-            "weight": s.weight, "angle": s.angle, "title": s.title or "—", "project": s.project or "—", "name": s.number or "plan",
+            "weight": s.weight, "angle": s.angle, "edge_marks": s.edge_marks, "title": s.title or "—", "project": s.project or "—", "name": s.number or "plan",
             "file": bpy.path.basename(bpy.data.filepath) or "—", "date": datetime.date.today().strftime("%m/%d/%Y" if s.unit == "in" else "%d/%m/%Y"),
             "brand": s.company, "lang": drawing_lang(s.lang), "brand_sub": "", "tool": _tool()}
     spec["iso_view"] = s.iso_view
@@ -115,8 +117,9 @@ def start(context):
         q = r3d.view_rotation
         spec["iso_dir"], spec["iso_up"] = list(q @ Vector((0, 0, -1))), list(q @ Vector((0, 1, 0)))
     std = s.standard if s.standard != "auto" else ("asme" if s.projection == "third" else "iso")
-    spec.update({"standard": std, "filing": s.filing_margin and std == "iso", "view_titles": s.view_titles, "dims_all": s.dims_all,
-                 "chain_ticks": s.chain_ticks, "checked": s.checked, "approved": s.approved, "material": s.material,
+    spec.update({"standard": std, "filing": s.filing_margin and std == "iso", "view_titles": s.view_titles, "svg_colors": s.svg_colors, "pdf_colors": s.pdf_colors,
+                 "layer_colors": {k: "#%02x%02x%02x" % tuple(round(v * 255) for v in getattr(s, "col_" + k.lower())) for k in ("VISIBLE", "HIDDEN", "DIMENSIONS", "TEXT", "FRAME", "HATCH")}, "dims_all": s.dims_all,
+                 "chain_ticks": s.chain_ticks, "checked": s.checked, "approved": s.approved, "material": s.material, "edges": s.edges.strip(),
                  "tolerances": tol_text(s), "tol_table": s.tol_class if s.tolerances == "ISO 2768" and s.tol_table else ""})
     if s.bom_by != "none":
         spec["bom"] = {"by": s.bom_by, "prop": s.bom_prop, "annex": s.bom_annex}
@@ -130,6 +133,13 @@ def start(context):
     spec.update(section.spec(context.scene))
     spec["views"] += [c["view"] for c in spec.get("sections", []) if c["view"] not in spec["views"]]
     spec["chains"] = chains.spec(s, set(names))
+    spec["manual_dims"] = dims.spec(context)
+    spec["holes"] = {"axes": s.hole_axes, "dims": s.hole_dims, "chamfers": s.chamfer_dims}
+    spec["angle_dims"] = [{"o": list(g.o), "a": list(g.a), "b": list(g.b)} for g in s.angles]
+    if s.overall_body:
+        skip = {o.name for o in s.overall_skip.all_objects} if s.overall_skip else set()
+        skip |= {n for n in names if HANDLE_WORDS.search(n)}
+        spec["overall_skip"] = sorted(skip & set(names))
     spec.update(titleblock.spec(s))
     if s.grid_mode != "none":
         spec["grid"] = {"mode": s.grid_mode, "step": s.grid_step, "views": [v for v in ("top", "front", "side") if getattr(s, "grid_" + v)],
@@ -143,13 +153,13 @@ def start(context):
             return rpt("Sheet “{}”: {}", empty[0], tr("nothing to draw (check Objects)"))
     pro = getattr(context.scene, "ichno_pro", None)
     if pro:
-        spec["dxf"], spec["dxf_real"], spec["bom_files"] = pro.dxf, pro.dxf_real, pro.bom_files
-        spec["manual_dims"] = [{"a": list(d.a), "b": list(d.b), "view": d.view.lower()} for d in pro.dims]
+        spec["hole_table"] = pro.hole_table
+        spec["dxf"], spec["dxf_real"], spec["bom_files"] = pro.dxf, pro.dxf_real, pro.bom_files and (pro.bom_csv or pro.bom_xlsx)
         if pro.balloons != "NONE" and s.bom_by != "none":
             spec["balloons"] = {"views": [pro.balloons.lower()], "straight": pro.balloon_straight}
         if pro.bom_extra and "bom" in spec:
             from .pro import bomcols
-            spec["bom"]["cols"] = bomcols.spec(pro)
+            spec["bom"]["cols"] = bomcols.spec(pro, spec.get("lang", "en"))
     with open(os.path.join(tmp, "spec.json"), "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False)
     cmd = [bpy.app.binary_path, "-b", blend, "--factory-startup", "--disable-autoexec", "-noaudio",
@@ -160,7 +170,10 @@ def start(context):
     folder = output_folder(s)
     if s.subfolder:
         folder = os.path.join(folder, re.sub(r'[<>:"/\\|?*]+', "-", spec["name"]).strip(" .") or "plan")
-    _job.update(proc=proc, tmp=tmp, out=out, pos=0, log=[], cancel=False, folder=folder, open=s.open_pdf)
+    pro = getattr(context.scene, "ichno_pro", None)
+    want = {".pdf": s.out_pdf, ".svg": s.out_svg, "-bom.csv": bool(pro and pro.bom_csv), "-bom.xlsx": bool(pro and pro.bom_xlsx)}
+    _job.update(proc=proc, tmp=tmp, out=out, pos=0, log=[], cancel=False, folder=folder, want=want,
+                open=s.open_pdf and s.on_done == "PDF" and s.out_pdf, view=s.open_pdf and s.on_done == "VIEW" and s.out_svg)
     job.running, job.progress, job.message = True, 0, tr("Starting…")
     return None
 
@@ -183,6 +196,9 @@ def collect():
         os.makedirs(_job["folder"], exist_ok=True)
     except OSError as e:
         return {"ok": False, "error": f"{_job['folder']} : {e.strerror or e}"}
+    want = _job.get("want") or {}
+    keep = [fn for fn in res["files"] if next((ok for end, ok in want.items() if fn.lower().endswith(end)), True)]
+    res["all"], res["files"] = res["files"], keep or res["files"]
     out = []
     for fn in res["files"]:
         dst = copy_free(os.path.join(_job["tmp"], "out", fn), os.path.join(_job["folder"], fn))
@@ -192,6 +208,11 @@ def collect():
             res.setdefault("warnings", []).append(rpt("“{}” is open in another program: saved as “{}”", fn, os.path.basename(dst)))
         out.append(dst)
     res["pdf"] = out[0]
+    try:
+        from . import viewer
+        viewer._written[os.path.normcase(os.path.abspath(out[0]))] = [d for d in out if d.lower().endswith(".svg")]
+    except Exception:
+        pass
     return res
 
 
@@ -262,9 +283,17 @@ class ICHNO_OT_make(bpy.types.Operator):
         for st in res.get("infos", []):
             self.report({"INFO"}, st)
         context.window_manager.ichno_job.last = res["pdf"]
-        if _job["open"]:
+        if _job["open"] and res["pdf"].lower().endswith(".pdf"):
             bpy.ops.wm.path_open(filepath=res["pdf"])
-        n = sum(fn.endswith(".svg") for fn in res["files"])
+        elif _job.get("view"):
+            from . import viewer
+            try:
+                err = viewer.load(context.window, res["pdf"])
+                if err:
+                    self.report({"WARNING"}, err)
+            except Exception as e:
+                self.report({"WARNING"}, f"View in Blender: {e}")
+        n = sum(fn.endswith(".svg") for fn in res.get("all", res["files"]))
         return self.finish(context, tr("{} sheets in {} s" if n > 1 else "{} sheet in {} s", n, res.get("seconds", 0)))
 
     def finish(self, context, msg):

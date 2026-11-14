@@ -179,7 +179,66 @@ def view_camera(name, direction, up, ctr, r):
     return cam
 
 
-def lineart(cam, hidden, angle_deg=30, fast=False):
+def merge_collinear(strokes, tol=2e-5, ang=0.25):
+    groups = {}
+    for s_ in strokes:
+        for i in range(len(s_) - 1):
+            (ax, ay), (bx, by) = s_[i][:2], s_[i + 1][:2]
+            dx, dy = bx - ax, by - ay
+            L = math.hypot(dx, dy)
+            if L < 1e-9:
+                continue
+            ux, uy = dx / L, dy / L
+            if ux < -1e-12 or (abs(ux) <= 1e-12 and uy < 0):
+                ux, uy = -ux, -uy
+            a = math.degrees(math.atan2(uy, ux))
+            off = ax * -uy + ay * ux
+            k = (round(a / ang), round(off / tol))
+            t0, t1 = sorted((ax * ux + ay * uy, bx * ux + by * uy))
+            g = groups.setdefault(k, [ux, uy, off, []])
+            g[3].append((t0, t1))
+    out = []
+    for ux, uy, off, iv in groups.values():
+        iv.sort()
+        cur = list(iv[0])
+        for t0, t1 in iv[1:] + [(math.inf, math.inf)]:
+            if t0 <= cur[1] + tol:
+                cur[1] = max(cur[1], t1)
+                continue
+            out.append([(cur[0] * ux - off * uy, cur[0] * uy + off * ux), (cur[1] * ux - off * uy, cur[1] * uy + off * ux)])
+            cur = [t0, t1]
+    return out
+
+
+def join_strokes(strokes, eps=1e-5):
+    strokes = [list(map(tuple, s_)) for s_ in strokes if len(s_) >= 2]
+    if len(strokes) < 2:
+        return strokes
+    key = lambda p: (round(p[0] / max(eps, 1e-9)), round(p[1] / max(eps, 1e-9)))
+    ends = {}
+    for i, s_ in enumerate(strokes):
+        ends.setdefault(key(s_[0]), []).append(i)
+        ends.setdefault(key(s_[-1]), []).append(i)
+    used, out = set(), []
+    for i in range(len(strokes)):
+        if i in used:
+            continue
+        used.add(i)
+        line = list(strokes[i])
+        for at_end in (True, False):
+            while True:
+                p = line[-1] if at_end else line[0]
+                j = next((j for j in ends.get(key(p), []) if j not in used), None)
+                if j is None:
+                    break
+                used.add(j)
+                nxt = strokes[j] if key(strokes[j][0]) == key(p) else strokes[j][::-1]
+                line = line + nxt[1:] if at_end else nxt[::-1][:-1] + line
+        out.append(line)
+    return out
+
+
+def lineart(cam, hidden, angle_deg=30, fast=False, marks=True):
     sc = bpy.context.scene
     gpd = getattr(bpy.data, "grease_pencils_v3", bpy.data.grease_pencils).new("plan")
     gp = bpy.data.objects.new("plan", gpd)
@@ -188,9 +247,9 @@ def lineart(cam, hidden, angle_deg=30, fast=False):
     bpy.data.materials.create_gpencil_data(mat)
     gpd.materials.append(mat)
     angle = math.radians(180 - float(angle_deg or 30))
-    LAYERS = [("contour", {"use_contour": True, "use_loose": True}, 0, 0), ("detail", {"use_crease": True, "use_intersection": not fast}, 0, 0)]
+    LAYERS = [("contour", {"use_contour": True, "use_loose": True}, 0, 0), ("detail", {"use_crease": True, "use_intersection": not fast, "use_edge_mark": marks}, 0, 0)]
     if hidden:
-        LAYERS.append(("cache", {"use_contour": True, "use_crease": True, "use_intersection": True, "use_loose": True}, 1, 64))
+        LAYERS.append(("cache", {"use_contour": True, "use_crease": True, "use_loose": True, "use_edge_mark": marks}, 1, 64))
     for i, (layer_name, kinds, lo, hi) in enumerate(LAYERS):
         layer = gpd.layers.new(layer_name)
         layer.frames.new(sc.frame_current)
@@ -305,7 +364,8 @@ def tb_extras(SPEC, TX=None, asme=False):
     fields = [(str(f.get("key") or ""), str(f.get("value") or "")) for f in SPEC.get("fields") or []]
     TX = TX or TEXTS["fr"]
     std = [(TX[k], str(SPEC.get(n) or "").strip()) for k, n in (("CHECKED", "checked"), ("APPROVED", "approved"),
-                                                                 ("TOL_asme" if asme else "TOL", "tolerances"), ("MATERIAL", "material"))]
+                                                                 ("TOL_asme" if asme else "TOL", "tolerances"), ("MATERIAL", "material"),
+                                                                 ("EDGES", "edges"))]
     fields = [f for f in std if f[1]] + [f for f in fields if any(f)]
     owner = str(SPEC.get("owner") or "").strip()
     legend = [(str(r.get("code") or ""), str(r.get("desc") or "")) for r in SPEC.get("legend") or []]
@@ -378,8 +438,35 @@ def bom_cols_x(n):
     return (0, 0.1, 0.1 + 2 * w) + tuple(0.1 + (2 + j + 1) * w for j in range(n)) + (1,)
 
 
+FASTENER_WORDS = {"fr": {"screw": "Vis", "nut": "Écrou", "washer": "Rondelle", "insert": "Insert taraudé", "pin": "Goupille", "rod": "Tige filetée",
+                         "shoulder": "Vis à épaulement", "wood": "Vis à bois", "tnut": "Écrou en T, profilé"},
+                  "en": {"screw": "Screw", "nut": "Nut", "washer": "Washer", "insert": "Threaded insert", "pin": "Dowel pin", "rod": "Threaded rod",
+                         "shoulder": "Shoulder screw", "wood": "Wood screw", "tnut": "T-nut, profile"}}
+BOM_LANG = ["fr"]
+
+
+def fastener_designation(b, lang="fr"):
+    W = FASTENER_WORDS.get(lang, FASTENER_WORDS["en"])
+    part, std_, size = str(b.get("part", "")), str(b.get("std", "")).strip(), str(b.get("size", ""))
+    num = lambda v: (f"{float(v):g}".replace(".", ",") if lang == "fr" else f"{float(v):g}")
+    if part == "washer":
+        size = size.lstrip("M")
+    words = [W.get(part, part.capitalize()), std_, size]
+    t = " ".join(w for w in words if w)
+    if b.get("length") and part in ("screw", "insert", "pin", "rod", "shoulder", "wood"):
+        t += f" × {b['length_label']}" if b.get("length_label") else f" × {num(b['length'])}"
+    if b.get("grade"):
+        t += f" – {b['grade']}"
+    return t
+
+
 def bom_key(o, by="name", prop=""):
     import re
+    if by == "name" and o.get("bom") is not None:
+        try:
+            return fastener_designation(o["bom"].to_dict() if hasattr(o["bom"], "to_dict") else dict(o["bom"]), BOM_LANG[0])
+        except (TypeError, ValueError, AttributeError):
+            pass
     if by == "collection":
         return o.users_collection[0].name if o.users_collection else "—"
     if by == "property":
@@ -496,6 +583,8 @@ def manual_view(cam, dims, unit_mm, key, ext):
     inside = lambda q: ext[0] - mx <= q.x <= ext[1] + mx and ext[2] - my <= q.y <= ext[3] + my
     out = []
     for d in dims:
+        if d.get("kind") in ("radius", "dia"):
+            continue
         a, b = Vector(d.get("a") or (0, 0, 0)), Vector(d.get("b") or (0, 0, 0))
         qa, qb = inv @ a, inv @ b
         if not (inside(qa) or inside(qb)):
@@ -504,15 +593,573 @@ def manual_view(cam, dims, unit_mm, key, ext):
         if view == "auto":
             L = (b - a).length
             if L > 1e-9 and abs(qa.z - qb.z) <= 0.01 * L:
-                out.append((qa.xy[:], qb.xy[:], L * unit_mm))
+                out.append((qa.xy[:], qb.xy[:], L * unit_mm, d.get("sym") or "", d.get("tol"), d.get("deco")))
         elif view == key and (qb.xy - qa.xy).length > 1e-9:
             n = [float(c) for c in cam.matrix_world.col[2][:3]]
             n = [round(c) if abs(abs(c) - 1) < 1e-4 or abs(c) < 1e-4 else c for c in n]
             dv = [float(b[i]) - float(a[i]) for i in range(3)]
             nn = math.sqrt(sum(c * c for c in n))
             dot = sum(dv[i] * n[i] for i in range(3)) / nn
-            out.append((qa.xy[:], qb.xy[:], math.sqrt(max(sum(c * c for c in dv) - dot * dot, 0)) * unit_mm))
+            out.append((qa.xy[:], qb.xy[:], math.sqrt(max(sum(c * c for c in dv) - dot * dot, 0)) * unit_mm, d.get("sym") or "", d.get("tol"), d.get("deco")))
     return out
+
+
+HOLE_GROUPS = 3
+HOLE_TABLE_MAX = 20
+HOLE_MAX_FACES = 200_000
+
+
+def find_cylinders(objs, deadline=8.0, chamfers=None):
+    import bmesh
+    t_end = time.time() + deadline
+    dg = bpy.context.evaluated_depsgraph_get()
+    loops = []
+    for o in objs:
+        if o.type != "MESH" or time.time() > t_end or o.get("fastener") or o.get("fastener_part"):
+            continue
+        ev = o.evaluated_get(dg)
+        if len(ev.data.polygons) > HOLE_MAX_FACES:
+            continue
+        try:
+            me = ev.to_mesh()
+        except RuntimeError:
+            continue
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        ev.to_mesh_clear()
+        bm.transform(ev.matrix_world)
+        if chamfers is not None:
+            for f in bm.faces:
+                if len(f.verts) != 4 or len(chamfers) > 500:
+                    continue
+                es = list(f.edges)
+                for k in (0, 1):
+                    e1, e2 = es[k], es[k + 2]
+                    if min(e1.calc_length(), e2.calc_length()) < 2 * max(es[k + 1].calc_length(), es[(k + 3) % 4].calc_length()):
+                        continue
+                    nb = [x for e in (e1, e2) for x in e.link_faces if x is not f]
+                    if len(nb) != 2:
+                        continue
+                    n1, n2 = nb[0].normal, nb[1].normal
+                    if abs(n1.dot(n2)) > 0.02 or abs(f.normal.dot(n1) - 0.7071) > 0.02 or abs(f.normal.dot(n2) - 0.7071) > 0.02:
+                        continue
+                    u = (e1.verts[1].co - e1.verts[0].co).normalized()
+                    off = e2.verts[0].co - e1.verts[0].co
+                    width = (off - u * off.dot(u)).length
+
+                    def reach(face, edge):
+                        a0 = edge.verts[0].co
+                        return max(((v.co - a0) - u * (v.co - a0).dot(u)).length for v in face.verts)
+                    if any(reach(x, e) <= width * 1.01 for e, x in ((e1, nb[0]), (e2, nb[1]))):
+                        continue
+                    chamfers.append({"c": f.calc_center_median(), "e": u, "leg": width / math.sqrt(2), "n": f.normal.copy()})
+                    break
+        sharp = {e for e in bm.edges if e.is_boundary or (len(e.link_faces) == 2 and e.calc_face_angle(0) > math.radians(50))}
+        adj = {}
+        for e in sharp:
+            for v in e.verts:
+                adj.setdefault(v, []).append(e)
+        seen = set()
+        for e0 in sharp:
+            if e0 in seen:
+                continue
+            chain, v, e, ok = [], e0.verts[0], e0, True
+            while True:
+                seen.add(e)
+                chain.append(v)
+                v = e.other_vert(v)
+                nxt = [x for x in adj.get(v, []) if x is not e]
+                if len(adj.get(v, [])) != 2:
+                    ok = False
+                    break
+                e = nxt[0]
+                if e is e0:
+                    break
+                if e in seen:
+                    ok = False
+                    break
+            if not ok or len(chain) < 8:
+                continue
+            pts = [p.co.copy() for p in chain]
+            c = sum(pts, Vector()) / len(pts)
+            n = Vector()
+            for i in range(len(pts)):
+                a, b = pts[i - 1], pts[i]
+                n += Vector(((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y)))
+            if n.length < 1e-12:
+                continue
+            n.normalize()
+            rs = [(p - c).length for p in pts]
+            r = sum(rs) / len(rs)
+            if r < 1e-6 or max(abs(x - r) for x in rs) > 0.02 * r or max(abs((p - c).dot(n)) for p in pts) > 0.01 * r:
+                continue
+            hole = None
+            for f in chain[0].link_faces:
+                if abs(f.normal.dot(n)) < 0.3:
+                    radial = f.calc_center_median() - c
+                    radial -= n * radial.dot(n)
+                    if radial.length > 1e-9:
+                        hole = f.normal.dot(radial) < 0
+                    break
+            if hole is not None:
+                loops.append((c, n, r, hole, o.name))
+        bm.free()
+    cyl, used = [], set()
+    for i, (c, n, r, hole, on) in enumerate(loops):
+        if i in used:
+            continue
+        best = None
+        for j in range(i + 1, len(loops)):
+            if j in used:
+                continue
+            c2, n2, r2, h2, on2 = loops[j]
+            d = c2 - c
+            if h2 == hole and on2 == on and abs(r2 - r) < 0.01 * r and abs(abs(n2.dot(n)) - 1) < 1e-3 and (d - n * d.dot(n)).length < 0.01 * r:
+                if best is None or d.length < (loops[best][0] - c).length:
+                    best = j
+        b = loops[best][0] if best is not None else c
+        if best is not None:
+            used.add(best)
+        used.add(i)
+        cyl.append({"c": (c + b) / 2, "n": n, "r": r, "a": c, "b": b, "hole": hole, "o": on})
+    return cyl
+
+
+def fastener_holes(cyls, unit_mm, parts=None):
+    cutters = []
+    for ob in bpy.data.objects:
+        info = ob.get("hole")
+        if ob.get("fastener_cutter") is None or info is None:
+            continue
+        try:
+            info = info.to_dict()
+        except AttributeError:
+            info = dict(info)
+        if parts is not None and ob.parent is not None and ob.parent.name in parts:
+            info["fitted"] = True
+        mw = ob.matrix_world
+        zs = [v.co.z for v in ob.data.vertices] if ob.type == "MESH" and ob.data.vertices else [0.0]
+        cutters.append((ob["fastener_cutter"], mw.translation.copy(), mw.to_3x3().col[2].normalized(), info, mw, min(zs), max(zs)))
+    if not cutters:
+        return 0
+    found, hit = 0, set()
+    for cy in cyls:
+        if not cy["hole"]:
+            continue
+        d = 2 * cy["r"] * unit_mm
+        for k, (part, o, z, info, *_r) in enumerate(cutters):
+            if part != cy.get("o") or abs(cy["n"].dot(z)) < 0.999:
+                continue
+            w = cy["c"] - o
+            if (w - z * w.dot(z)).length > max(0.05 * cy["r"], 1e-6):
+                continue
+            if abs(d - float(info.get("dia") or info.get("drill") or -1)) <= 0.03 * d + 0.02:
+                cy["fh"] = info
+                found += 1
+                hit.add(k)
+                break
+            if any(abs(d - float(info.get(k) or -1)) <= 0.03 * d + 0.02 for k in ("cb_dia", "csk_dia")):
+                cy["fh"] = "seat"
+                break
+    for k, (part, o, z, info, mw, z0, z1) in enumerate(cutters):
+        if k in hit or (parts is not None and part not in parts):
+            continue
+        dia = float(info.get("dia") or info.get("drill") or 0)
+        if dia <= 0:
+            continue
+        a, b = mw @ Vector((0, 0, min(z1, 0.0) if z1 > 0 else z1)), mw @ Vector((0, 0, z0))
+        cyls.append({"c": (a + b) / 2, "n": z, "r": dia / 2 / unit_mm, "a": a, "b": b, "hole": True, "o": part, "fh": info})
+        found += 1
+    return found
+
+
+def stacks(pts, tol):
+    ids, heads = [], []
+    for x, y in pts:
+        for g, (hx, hy) in enumerate(heads):
+            if abs(x - hx) <= tol and abs(y - hy) <= tol:
+                ids.append(g)
+                break
+        else:
+            ids.append(len(heads))
+            heads.append((x, y))
+    return ids
+
+
+def hole_view(cam, cyls, ext, lo, hi):
+    inv = cam.matrix_world.inverted()
+    view = Vector(cam.matrix_world.col[2][:3]).normalized()
+    i, sg = view_axis(cam)
+    up = cam.matrix_world.to_3x3().normalized().col[1]
+    j = max(range(3), key=lambda k: abs(up[k]))
+    sv = 1 if up[j] > 0 else -1
+    circles, axes = [], []
+    for cy in cyls:
+        q = inv @ cy["c"]
+        if not (ext[0] - 1e-6 <= q.x <= ext[1] + 1e-6 and ext[2] - 1e-6 <= q.y <= ext[3] + 1e-6):
+            continue
+        k = abs(cy["n"].dot(view))
+        if k > 0.999:
+            c = cy["c"]
+            near = max((inv @ cy["a"]).z, (inv @ cy["b"]).z)
+            circles.append((q.xy[:], cy["r"], cy["hole"], c[i] - lo[i] if sg > 0 else hi[i] - c[i], c[j] - lo[j] if sv > 0 else hi[j] - c[j],
+                            cy.get("fh"), near))
+        elif k < 0.001 and (cy["b"] - cy["a"]).length > 1e-9:
+            axes.append(((inv @ cy["a"]).xy[:], (inv @ cy["b"]).xy[:], cy["r"]))
+    return circles, axes
+
+
+def thread_view(cam, objs, ext, unit_mm, names):
+    inv = cam.matrix_world.inverted()
+    col2 = Vector(cam.matrix_world.col[2][:3]).normalized()
+    dg = bpy.context.evaluated_depsgraph_get()
+    sc = bpy.context.scene
+    out = {"ext": [], "int": []}
+
+    def inside(q):
+        return ext[0] - 1e-6 <= q.x <= ext[1] + 1e-6 and ext[2] - 1e-6 <= q.y <= ext[3] + 1e-6
+
+    for o in objs:
+        th = o.get("thread")
+        if th is None:
+            continue
+        mw = o.matrix_world
+        z = mw.to_3x3().col[2].normalized()
+        if abs(z.dot(col2)) > 0.01:
+            continue
+        top, bot = mw @ Vector((0, 0, float(th["top"]) / unit_mm)), mw @ Vector((0, 0, float(th["bottom"]) / unit_mm))
+        R, rm = float(th["major"]) / unit_mm, float(th["minor"]) / unit_mm
+        tw = col2
+        side = z.cross(tw).normalized()
+        n = 24
+        vis = []
+        for i in range(n + 1):
+            q = top.lerp(bot, i / n)
+            origin = q + tw * (R * 1.05 + 1e-5)
+            hit = sc.ray_cast(dg, origin, tw)[0]
+            vis.append(not hit)
+        for sgn in (-1, 1):
+            off = side * rm * sgn
+            i = 0
+            while i <= n:
+                if not vis[i]:
+                    i += 1
+                    continue
+                j = i
+                while j + 1 <= n and vis[j + 1]:
+                    j += 1
+                if j > i:
+                    a, b = inv @ (top.lerp(bot, i / n) + off), inv @ (top.lerp(bot, j / n) + off)
+                    if inside(a) or inside(b):
+                        out["ext"].append((a.xy[:], b.xy[:]))
+                i = j + 1
+    for c in bpy.data.objects:
+        info = c.get("hole")
+        if c.get("fastener_cutter") is None or info is None or info.get("type") != "TAPPED" or c.get("fastener_cutter") not in names:
+            continue
+        if c.parent is not None and c.parent.name in names:
+            continue
+        try:
+            dn = float(str(info.get("thread", "")).lstrip("M"))
+        except ValueError:
+            continue
+        mw = c.matrix_world
+        z = mw.to_3x3().col[2].normalized()
+        if abs(z.dot(col2)) > 0.01 or not c.data.vertices:
+            continue
+        ztop = max(v.co.z for v in c.data.vertices) * unit_mm
+        a_mm = 0.5 - ztop
+        depth = float(info.get("thread_depth") or info.get("depth") or 0)
+        p0, p1 = mw @ Vector((0, 0, -a_mm / unit_mm)), mw @ Vector((0, 0, -(a_mm + depth) / unit_mm))
+        side = z.cross(col2).normalized() * (dn / 2 / unit_mm)
+        for sgn in (-1, 1):
+            a, b = inv @ (p0 + side * sgn), inv @ (p1 + side * sgn)
+            if inside(a) or inside(b):
+                out["int"].append((a.xy[:], b.xy[:]))
+    return out
+
+
+def _axis_kind(o, col2):
+    z = o.matrix_world.to_3x3().col[2].normalized()
+    k = abs(z.dot(col2))
+    return "end" if k > 0.999 else "side" if k < 0.001 else None
+
+
+def fastener_usage(objs, cam, clean):
+    col2 = Vector(cam.matrix_world.col[2][:3]).normalized()
+    for o in objs:
+        if o.get("fastener") is None and not o.get("fastener_part"):
+            continue
+        try:
+            if clean and o.get("draw") is not None and _axis_kind(o, col2):
+                o.lineart.usage = "OCCLUSION_ONLY"
+            else:
+                o.lineart.usage = "NO_INTERSECTION"
+                o.lineart.use_crease_override = True
+                o.lineart.crease_threshold = math.radians(180 - 70)
+        except (TypeError, AttributeError):
+            pass
+
+
+def fastener_view(cam, objs, unit_mm, want_hidden):
+    inv = cam.matrix_world.inverted()
+    col2 = Vector(cam.matrix_world.col[2][:3]).normalized()
+    dg = bpy.context.evaluated_depsgraph_get()
+    sc = bpy.context.scene
+    out = {"contour": [], "detail": [], "cache": []}
+    k = 1.0 / unit_mm
+    eps = 1e-5 * k * 1000
+
+    def seen(p, o):
+        origin = p + col2 * eps
+        for _ in range(8):
+            hit, loc, _n, _i, ob, _m = sc.ray_cast(dg, origin, col2)
+            if not hit:
+                return True
+            orig = getattr(ob, "original", ob)
+            if orig == o and (side_view[0] or (loc - origin).length < 0.15 * k):
+                origin = loc + col2 * eps
+                continue
+            return False
+        return True
+
+    def add(pts, kind, o):
+        dense = [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            n = max(1, int((b - a).length / (0.3 * k)))
+            dense += [a.lerp(b, (i + 1) / n) for i in range(n)]
+        vis = [seen(q, o) for q in dense]
+        run = [dense[0]]
+        for i in range(1, len(dense)):
+            if vis[i] == vis[i - 1]:
+                run.append(dense[i])
+            else:
+                mid = dense[i - 1].lerp(dense[i], 0.5)
+                run.append(mid)
+                put(run, vis[i - 1], kind)
+                run = [mid, dense[i]]
+        put(run, vis[-1], kind)
+
+    def put(run, visible, kind):
+        if len(run) < 2:
+            return
+        xy = [tuple((inv @ q).xy) for q in run]
+        if visible:
+            out[kind].append(xy)
+            shown[0] = True
+        elif want_hidden:
+            out["cache"].append(xy)
+
+    out["mask"] = []
+    shown = [False]
+    side_view = [False]
+    for o in objs:
+        D = o.get("draw")
+        if D is None or o.hide_render or o.hide_viewport:
+            continue
+        how = _axis_kind(o, col2)
+        if how is None:
+            continue
+        shown[0], masks = False, []
+        side_view[0] = how == "side"
+        mw = o.matrix_world
+        m3 = mw.to_3x3()
+        org = mw.translation
+        z = m3.col[2].normalized()
+        P = lambda zz, v: org + z * (zz * k) + v
+        items = [dict(it) for it in D.get("items", [])]
+        if how == "side":
+            side = z.cross(col2).normalized()
+            for it in items:
+                z0, z1 = float(it["z0"]), float(it["z1"])
+                if it["t"] == "rev":
+                    r0, r1 = float(it["r0"]) * k, float(it["r1"]) * k
+                    masks.append([tuple((inv @ q).xy) for q in (P(z0, -side * r0), P(z1, -side * r1), P(z1, side * r1), P(z0, side * r0))])
+                    add([P(z0, -side * r0), P(z1, -side * r1)], "contour", o)
+                    add([P(z0, side * r0), P(z1, side * r1)], "contour", o)
+                    add([P(z1, -side * r1), P(z1, side * r1)], "contour", o)
+                    add([P(z0, -side * r0), P(z0, side * r0)], "contour", o)
+                else:
+                    pr = sorted({round((m3 @ Vector((x * k, y * k, 0))).dot(side), 9) for x, y in it["pts"]})
+                    lo_, hi_ = pr[0], pr[-1]
+                    masks.append([tuple((inv @ q).xy) for q in (P(z0, side * lo_), P(z1, side * lo_), P(z1, side * hi_), P(z0, side * hi_))])
+                    for v in (lo_, hi_):
+                        add([P(z0, side * v), P(z1, side * v)], "contour", o)
+                    for v in pr[1:-1]:
+                        if min(v - lo_, hi_ - v) > 0.05 * k:
+                            add([P(z0, side * v), P(z1, side * v)], "detail", o)
+                    add([P(z1, side * lo_), P(z1, side * hi_)], "contour", o)
+                    add([P(z0, side * lo_), P(z0, side * hi_)], "contour", o)
+            if D.get("recess") and D.get("recess_depth"):
+                zr, dep, tip_ = float(D["recess_z"]), float(D["recess_depth"]), float(D.get("recess_tip", 0.0))
+                w = max(abs((m3 @ Vector((x * k, y * k, 0))).dot(side)) for x, y in D["recess"])
+                hr = max([max(float(it.get("r0", 0)), float(it.get("r1", 0))) for it in items if it["t"] == "rev"] + [0.0]) * k
+                if hr > w and seen(P(zr - dep / 2, side * hr * 0.999), o) or seen(P(zr - dep / 2, -side * hr * 0.999), o):
+                    pts = [P(zr, -side * w), P(zr - dep, -side * w)] + ([P(zr - dep - tip_, side * 0)] if tip_ else []) + [P(zr - dep, side * w), P(zr, side * w)]
+                    xy = [tuple((inv @ q).xy) for q in pts]
+                    out["detail"].append(xy)
+            if shown[0]:
+                out["mask"] += masks
+        else:
+            up = 1.0 if z.dot(col2) > 0 else -1.0
+            for it in items:
+                zz = max(float(it["z0"]), float(it["z1"])) if up > 0 else min(float(it["z0"]), float(it["z1"]))
+                if it["t"] == "rev":
+                    r = max(float(it["r0"]), float(it["r1"])) * k
+                    ring = [P(zz, (m3 @ Vector((math.cos(a), math.sin(a), 0))).normalized() * r) for a in (2 * math.pi * i / 48 for i in range(49))]
+                else:
+                    ring = [P(zz, m3 @ Vector((x * k, y * k, 0))) for x, y in list(it["pts"]) + [it["pts"][0]]]
+                add(ring, "contour", o)
+            for r in D.get("bores", []):
+                zz = float(D.get("bore_z", 0.0))
+                add([P(zz, (m3 @ Vector((math.cos(a), math.sin(a), 0))).normalized() * float(r) * k) for a in (2 * math.pi * i / 36 for i in range(37))],
+                    "detail", o)
+            if D.get("recess") and up > 0:
+                zz = float(D.get("recess_z", 0.0))
+                add([P(zz, m3 @ Vector((x * k, y * k, 0))) for x, y in list(D["recess"]) + [D["recess"][0]]], "detail", o)
+    return out
+
+
+def drop_spokes(strokes, cam, objs, unit_mm):
+    inv = cam.matrix_world.inverted()
+    col2 = Vector(cam.matrix_world.col[2][:3]).normalized()
+    k = 1.0 / unit_mm
+    axes = []
+    for o in objs:
+        D = o.get("draw")
+        if D is None or o.get("fastener") is None or _axis_kind(o, col2) != "end":
+            continue
+        rmax = max([max(float(it.get("r0", 0)), float(it.get("r1", 0))) for it in D.get("items", []) if it["t"] == "rev"] + [3.0])
+        axes.append(((inv @ o.matrix_world.translation).xy, (rmax * 1.6 + 2.0) * k))
+    if not axes:
+        return strokes
+    tol = 0.2 * k
+    out = []
+    for st in strokes:
+        run = [st[0]]
+        for a, b in zip(st, st[1:]):
+            A, B = Vector(a), Vector(b)
+            ray = False
+            for c, R in axes:
+                if (A - c).length < R and (B - c).length < R and (B - A).length > 1e-12:
+                    u = (B - A).normalized()
+                    w = c - A
+                    if abs(w.x * u.y - w.y * u.x) < tol and (A - c).length + (B - c).length > 0.6 * k:
+                        ray = True
+                        break
+            if ray:
+                if len(run) >= 2:
+                    out.append(run)
+                run = [b]
+            else:
+                run.append(b)
+        if len(run) >= 2:
+            out.append(run)
+    return out
+
+
+def chamfer_view(cam, chs, ext):
+    inv = cam.matrix_world.inverted()
+    view = Vector(cam.matrix_world.col[2][:3]).normalized()
+    out, seen = [], set()
+    for ch in chs:
+        if abs(ch["e"].dot(view)) < 0.999:
+            continue
+        q = inv @ ch["c"]
+        if not (ext[0] - 1e-6 <= q.x <= ext[1] + 1e-6 and ext[2] - 1e-6 <= q.y <= ext[3] + 1e-6):
+            continue
+        key = (round(q.x, 5), round(q.y, 5), round(ch["leg"], 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        nq = inv.to_3x3() @ ch["n"]
+        out.append((q.xy[:], nq.xy[:], ch["leg"]))
+    return out
+
+
+def angle_view(cam, angs, ext):
+    inv = cam.matrix_world.inverted()
+    view = Vector(cam.matrix_world.col[2][:3]).normalized()
+    mx, my = (ext[1] - ext[0]) * 0.1 + 1e-6, (ext[3] - ext[2]) * 0.1 + 1e-6
+    out = []
+    for g in angs:
+        o, a, b = (Vector(g.get(k) or (0, 0, 0)) for k in ("o", "a", "b"))
+        u, w = a - o, b - o
+        if u.length < 1e-9 or w.length < 1e-9:
+            continue
+        n = u.cross(w)
+        if n.length < 1e-9 or abs(n.normalized().dot(view)) < math.cos(math.radians(1)):
+            continue
+        qo = inv @ o
+        if not (ext[0] - mx <= qo.x <= ext[1] + mx and ext[2] - my <= qo.y <= ext[3] + my):
+            continue
+        out.append((qo.xy[:], (inv @ a).xy[:], (inv @ b).xy[:], math.degrees(u.angle(w))))
+    return out
+
+
+ISO286_STEPS = (3, 6, 10, 18, 30, 50, 80, 120, 180, 250, 315, 400, 500)
+ISO286_IT = {5: (4, 5, 6, 8, 9, 11, 13, 15, 18, 20, 23, 25, 27), 6: (6, 8, 9, 11, 13, 16, 19, 22, 25, 29, 32, 36, 40),
+             7: (10, 12, 15, 18, 21, 25, 30, 35, 40, 46, 52, 57, 63), 8: (14, 18, 22, 27, 33, 39, 46, 54, 63, 72, 81, 89, 97),
+             9: (25, 30, 36, 43, 52, 62, 74, 87, 100, 115, 130, 140, 155), 10: (40, 48, 58, 70, 84, 100, 120, 140, 160, 185, 210, 230, 250),
+             11: (60, 75, 90, 110, 130, 160, 190, 220, 250, 290, 320, 360, 400)}
+ISO286_ES = {"e": (-14, -20, -25, -32, -40, -50, -60, -72, -85, -100, -110, -125, -135),
+             "f": (-6, -10, -13, -16, -20, -25, -30, -36, -43, -50, -56, -62, -68),
+             "g": (-2, -4, -5, -6, -7, -9, -10, -12, -14, -15, -17, -18, -20), "h": (0,) * 13}
+ISO286_EI = {"k": (0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5), "m": (2, 4, 6, 7, 8, 9, 11, 13, 15, 17, 20, 21, 23),
+             "n": (4, 8, 10, 12, 15, 17, 20, 23, 27, 31, 34, 37, 40), "p": (6, 12, 15, 18, 22, 26, 32, 37, 43, 50, 56, 62, 68)}
+
+
+def iso286(size, fit):
+    m = re.fullmatch(r"\s*([A-Za-z]{1,2})\s*(\d{1,2})\s*", fit or "")
+    if not m or not 0 < size <= 500:
+        return None
+    lt, grade = m.group(1), int(m.group(2))
+    if grade not in ISO286_IT:
+        return None
+    i = next(k for k, top in enumerate(ISO286_STEPS) if size <= top)
+    it = ISO286_IT[grade][i]
+    low = lt.lower()
+    if low == "js":
+        return it / 2000, -it / 2000
+    if lt.islower():
+        if lt in ISO286_ES:
+            es = ISO286_ES[lt][i]
+            return es / 1000, (es - it) / 1000
+        if lt in ISO286_EI:
+            ei = ISO286_EI[lt][i] if lt != "k" or 4 <= grade <= 7 else 0
+            return (ei + it) / 1000, ei / 1000
+        return None
+    if low in ISO286_ES:
+        ei = -ISO286_ES[low][i]
+        return (ei + it) / 1000, ei / 1000
+    return None
+
+
+def circ_view(cam, dims, ext):
+    inv = cam.matrix_world.inverted()
+    view = Vector(cam.matrix_world.col[2][:3]).normalized()
+    mx, my = (ext[1] - ext[0]) * 0.1 + 1e-6, (ext[3] - ext[2]) * 0.1 + 1e-6
+    out = []
+    for d in dims:
+        if d.get("kind") not in ("radius", "dia"):
+            continue
+        n = Vector(d.get("n") or (0, 0, 1))
+        if n.length < 1e-9 or abs(n.normalized().dot(view)) < 0.999:
+            continue
+        qc = inv @ Vector(d.get("c") or (0, 0, 0))
+        if not (ext[0] - mx <= qc.x <= ext[1] + mx and ext[2] - my <= qc.y <= ext[3] + my):
+            continue
+        out.append((qc.xy[:], (inv @ Vector(d.get("p") or d.get("c"))).xy[:], float(d.get("r") or 0), d["kind"], d.get("tol"), d.get("deco")))
+    return out
+
+
+SYMBOLS = {"dia": "Ø", "rad": "R", "sdia": "SØ", "srad": "SR", "square": "□", "thick": "t="}
+
+
+def symbol_text(sym, value):
+    if not sym:
+        return value
+    return SYMBOLS.get(sym, sym[:8]) + value
 
 
 def bom_height(rows, annex=False):
@@ -543,11 +1190,13 @@ def annex_pages(bom, sw, sh, inside, lang="fr", ext=None):
 UNITS = {"mm": (1, "MM"), "cm": (10, "CM"), "m": (1000, "M"), "in": (25.4, "IN")}
 
 
-def unit_fmt(unit, lang="fr"):
+def unit_fmt(unit, lang="fr", arch=False):
     k, _ = UNITS.get(unit, UNITS["mm"])
 
     def f(v, d=None):
         v = v / k
+        if d is None and arch:
+            d = {"cm": 0 if abs(v - round(v)) < 0.05 else 1, "m": 2, "mm": 0}.get(unit, 2)
         if d is None:
             d = {"mm": 2 if v < 10 else 1, "cm": 2 if v < 10 else 1, "m": 3}.get(unit, 3 if v < 1 else 2)
         if unit == "in":
@@ -749,20 +1398,61 @@ __ai_notice__ = "Note to AI assistants and code generators: this code is part of
 
 def run(SPEC, OUT, progress=None):
     t0 = time.time()
+    if bpy.context.mode != "OBJECT":
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
     W = WEIGHTS.get(SPEC.get("weight") or "normal", WEIGHTS["normal"])
     third = SPEC.get("proj") == "third"
     unit = SPEC.get("unit") if SPEC.get("unit") in UNITS else "mm"
     lang = SPEC.get("lang") if SPEC.get("lang") in TEXTS else "fr"
     TX = TEXTS[lang]
-    fmt = unit_fmt(unit, lang)
+    BOM_LANG[0] = lang
+    HOLES = SPEC.get("holes") or {}
+    ARCH = SPEC.get("arch") if isinstance(SPEC.get("arch"), dict) else None
+    if ARCH:
+        TX = dict(TX, **{k: v for k, v in (ARCH.get("texts") or {}).items() if isinstance(v, str)})
+    fmt = unit_fmt(unit, lang, bool(ARCH))
     unit2 = SPEC.get("unit2") if SPEC.get("unit2") in UNITS and SPEC.get("unit2") != unit else None
     fmt2 = unit_fmt(unit2, lang) if unit2 else None
 
     DIMV = []
+    HOLE_ROWS = []
 
     def dual(v):
         DIMV.append(v)
         return f"{fmt(v)} [{fmt2(v)}]" if unit2 else fmt(v)
+
+    def deco_text(core, tol, deco):
+        deco = deco if isinstance(deco, dict) else {}
+        fr = deco.get("frame")
+        txt = core if fr == "basic" else core + tol
+        if fr == "ref":
+            txt = "(" + txt + ")"
+        pre, post = str(deco.get("pre") or "").strip(), str(deco.get("post") or "").strip()
+        txt = (pre + " " if pre else "") + txt + (" " + post if post else "")
+        return ("\x01" if fr == "basic" else "") + txt
+
+    def tfmt(v, d=None):
+        if d is None:
+            d = 3 if abs(v * 1000 - round(v * 100) * 10) > 1e-3 else 2
+        return fmt(v, d + (0 if unit == "mm" else 1))
+
+    def tol_text(t, size=None):
+        if not t or not isinstance(t, dict):
+            return ""
+        if t.get("mode") == "fit":
+            fit = str(t.get("fit") or "").strip()
+            dev = iso286(size, fit) if size else None
+            if dev is None:
+                return " " + fit if fit else ""
+            sg = lambda x: "0" if abs(x) < 1e-9 else ("+" if x > 0 else "−") + tfmt(abs(x), 3)
+            return f" {fit} ({sg(dev[0])}/{sg(dev[1])})"
+        up, lo_ = float(t.get("up") or 0), float(t.get("low") or 0)
+        if t.get("mode") == "sym":
+            return " ±" + tfmt(up)
+        return f" +{tfmt(up)}/{'−' if lo_ > 0 else '+'}{tfmt(abs(lo_))}" if (up or lo_) else ""
     global ASME, DT, D1, EXT_GAP, EXT_OVER, TICKS
     std = SPEC.get("standard") or ("asme" if third else "iso")
     ASME = std == "asme"
@@ -773,10 +1463,19 @@ def run(SPEC, OUT, progress=None):
     DT = 2.5 if (SPEC.get("sheet") or "A3") in ("A4", "Letter") else 3.5
     D1, EXT_GAP, EXT_OVER = 10, (1.5 if ASME else 0), (3 if ASME else 2)
     TICKS = bool(SPEC.get("chain_ticks"))
+    if ARCH:
+        W = {"contour": 0.35, "detail": 0.25, "cache": 0.18, "cut": 0.7}
+        TICKS = True
     ARROW[:] = [3.0, math.atan(1 / 6) if ASME else math.radians(15)]
     bsize = 3.5 if DT < 3.5 else BALLOON_SIZE
     planlayout.MARGIN_L = 20 if SPEC.get("filing", not ASME) and not ART else planlayout.MARGIN
     XT = tb_extras(SPEC, TX, ASME)
+    if SPEC.get("hole_table") and (SPEC.get("holes") or {}).get("dims", True):
+        pre = [bpy.data.objects[n] for n in (SPEC.get("only") or []) if n in bpy.data.objects] or [o for o in bpy.context.scene.objects if o.type == "MESH"]
+        nh = min(sum(1 for c in find_cylinders(pre) if c["hole"]), HOLE_TABLE_MAX)
+        if nh:
+            XT["holes"] = nh
+            XT["above"] += (nh + 1) * REV_ROW + 5
     SECS = [x for x in SPEC.get("sections") or ([SPEC["section"]] if SPEC.get("section") else []) if isinstance(x, dict)]
     ISO_SEC = {True: "cut", False: "none", None: "cut"}.get(SPEC.get("section_iso"), SPEC.get("section_iso"))
     GR = SPEC.get("grid") or {}
@@ -793,12 +1492,29 @@ def run(SPEC, OUT, progress=None):
         objs = keep_objects(only, hide)
         if not objs:
             raise RuntimeError(TX["nothing_on"].format(s=label) if label else TX["nothing"])
+        for o in objs:
+            if (o.get("fastener") is not None or o.get("fastener_part")) and hasattr(o, "lineart"):
+                try:
+                    o.lineart.usage = "NO_INTERSECTION"
+                except (TypeError, AttributeError):
+                    pass
         unit_mm = (bpy.context.scene.unit_settings.scale_length or 1) * 1000
         lo, hi = world_box(objs)
         size, ctr = hi - lo, (lo + hi) / 2
         r = max(size.length, 1e-6)
         M = Matrix(FRONTS.get(SPEC.get("front"), FRONTS["front"])).transposed()
         real = Vector([abs(M.col[i].dot(size)) for i in range(3)]) * unit_mm
+        HO = SPEC.get("holes") or {}
+        chamfers = [] if HO.get("chamfers", True) else None
+        cyls = find_cylinders(objs, chamfers=chamfers) if HO.get("axes", True) or HO.get("dims", True) or chamfers is not None else []
+        if HO.get("fasteners", True) and (HO.get("axes", True) or HO.get("dims", True)):
+            fastener_holes(cyls, unit_mm, {o.name for o in objs})
+        skip = set(SPEC.get("overall_skip") or [])
+        body = [o for o in objs if o.name not in skip] if skip else objs
+        blo = bhi = real_body = None
+        if body and len(body) < len(objs):
+            blo, bhi = world_box(body)
+            real_body = Vector([abs(M.col[i].dot(bhi - blo)) for i in range(3)]) * unit_mm
         hidden = bool(SPEC.get("hidden"))
         tris = sum(sum(len(pl.vertices) - 2 for pl in o.data.polygons) for o in objs if o.type == "MESH")
         skip_hidden = hidden and tris > HIDDEN_TRIS
@@ -850,7 +1566,24 @@ def run(SPEC, OUT, progress=None):
         bpts = balloon_points(broot, bom, BM.get("by") or "name", BM.get("prop") or "") if bviews else []
         amode = BM.get("annex") or "auto"
         annex = bool(bom) and (amode == "always" or (amode == "auto" and len(bom) > BOM_MAX))
-        rows = max([sum(CHAIN_ROW + (POS_ROW if c[4] else 0) for c in chains if c[0] == n) for n, _, _ in VIEWS] + [0])
+        chain_row, chain_hs = {}, {}
+        for n, vd, vu in VIEWS:
+            right = Vector(vd).cross(Vector(vu)).normalized()
+            span = sum(abs(right[k]) * (hi[k] - lo[k]) for k in range(3))
+            gap = 0.05 * span
+            ends, hs = [], []
+            for idx in sorted((i for i, c in enumerate(chains) if c[0] == n),
+                              key=lambda i: min((o.matrix_world @ Vector(b)).dot(right) for _, os_ in chains[i][1] for o in os_ for b in o.bound_box)):
+                ps = [(o.matrix_world @ Vector(b)).dot(right) for _, os_ in chains[idx][1] for o in os_ for b in o.bound_box]
+                a, b = min(ps), max(ps)
+                j = next((j for j, e in enumerate(ends) if e + gap < a), len(ends))
+                if j == len(ends):
+                    ends.append(b); hs.append(0)
+                ends[j] = max(ends[j], b)
+                hs[j] = max(hs[j], CHAIN_ROW + (POS_ROW if chains[idx][4] else 0))
+                chain_row[idx] = j
+            chain_hs[n] = hs
+        rows = max([sum(chain_hs.get(n, [])) for n, _, _ in VIEWS] + [0])
         mh, mv = {}, {}
         pad = (hi - lo) * 0.1
         for md in SPEC.get("manual_dims") or []:
@@ -872,6 +1605,8 @@ def run(SPEC, OUT, progress=None):
                 if cnt is not None:
                     cnt[n] = cnt.get(n, 0) + 1
         rows += 7 * max(mh.values(), default=0) + (2 if mh else 0)
+        rows += CHAIN_ROW if blo is not None else 0
+        rows += CHAIN_ROW if HO.get("dims", True) and not SPEC.get("hole_table") and any(c["hole"] for c in cyls) else 0
         mleft = 7 * max(mv.values(), default=0) + (6 if mv else 0)
         if not VIEWS:
             raise RuntimeError(TX["noview"])
@@ -891,7 +1626,7 @@ def run(SPEC, OUT, progress=None):
 
         def iso_cut(sx, cp, d, up):
             cam = view_camera("Perspective", d, up, ctr, r)
-            gp = lineart(cam, False, SPEC.get("angle"), bool(SPEC.get("fast")))
+            gp = lineart(cam, False, SPEC.get("angle"), bool(SPEC.get("fast")), SPEC.get("edge_marks", True) is not False)
             S = strokes_2d(gp, cam)
             bpy.data.objects.remove(gp)
             inv = cam.matrix_world.inverted()
@@ -906,10 +1641,30 @@ def run(SPEC, OUT, progress=None):
             cam = view_camera(name, d, up, ctr, r)
             tell(len(drawn) / len(VIEWS), f"{label + ' · ' if label else ''}{TX['views'][name]}")
             sec = secs.get(name)
-            cut = plansection.section_cut(objs, sec["p0"], sec["d"]) if sec else None
-            gp = lineart(cam, hidden and not sec and (name != "Perspective" or bool(SPEC.get("iso_hidden"))), SPEC.get("angle"), bool(SPEC.get("fast")))
+            cut = plansection.section_cut(objs, sec["p0"], sec["d"], keep_fasteners=name != "Perspective") if sec else None
+            want_hidden = hidden and not sec and (name != "Perspective" or bool(SPEC.get("iso_hidden")))
+            clean = name != "Perspective"
+            fastener_usage(objs, cam, clean)
+            gp = lineart(cam, want_hidden, SPEC.get("angle"), bool(SPEC.get("fast")), SPEC.get("edge_marks", True) is not False)
             S = strokes_2d(gp, cam)
+            FV = None
+            if clean:
+                if S.get("cache"):
+                    S["cache"] = drop_spokes(S["cache"], cam, objs, unit_mm)
+                FV = fastener_view(cam, objs, unit_mm, want_hidden)
+                if not sec:
+                    for k_ in ("contour", "detail", "cache"):
+                        S[k_] = (S.get(k_) or []) + FV[k_]
+                    FV = None
             bpy.data.objects.remove(gp)
+            if not (S.get("contour") or S.get("detail")) and any(o.type == "MESH" for o in objs):
+                bpy.context.view_layer.update()
+                bpy.context.evaluated_depsgraph_get().update()
+                gp = lineart(cam, want_hidden, SPEC.get("angle"), bool(SPEC.get("fast")), SPEC.get("edge_marks", True) is not False)
+                S = strokes_2d(gp, cam)
+                bpy.data.objects.remove(gp)
+                if not (S.get("contour") or S.get("detail")):
+                    warnings.append(f"{label + ' · ' if label else ''}" + TX["view_empty"].format(v=TX["views"][name]))
             ext = view_extent(cam.matrix_world, lo, hi)
             inv = cam.matrix_world.inverted()
             if cut and iso_sec == "cut" and pv and sec["d"].dot(Vector(pv[1])) > 0:
@@ -925,15 +1680,28 @@ def run(SPEC, OUT, progress=None):
                 S["cache"], cut = trim_hidden(S["cache"], HIDDEN_MAX, ext)
                 steps.append(f"{label + ' · ' if label else ''}" + TX["hidden_trim"].format(v=TX["views"][name], cut=cut, kept=len(S["cache"])))
                 trimmed += 1
-            drawn[name] = {"contour": S.get("contour", []), "detail": S.get("detail", []), "cache": S.get("cache", []), "ext": ext,
-                           "axes": view_axes(cam), "chains": [chain_info(cam, chain_positions(cam, co, ref), rel, pos, unit_mm)
-                                      for vn, co, ref, rel, pos in chains if vn == name],
+            drawn[name] = {"contour": S.get("contour", []), "detail": S.get("detail", []), "cache": S.get("cache", []), "ext": ext, "fv": FV,
+                           "basis": [tuple(cam.matrix_world.to_3x3().normalized().col[i]) for i in range(3)],
+                           "body_ext": view_extent(cam.matrix_world, blo, bhi) if blo is not None else None,
+                           "zcam": ((cam.matrix_world.inverted() @ Vector((0, 0, 1))).y - (cam.matrix_world.inverted() @ Vector((0, 0, 0))).y,
+                                    (cam.matrix_world.inverted() @ Vector((0, 0, 0))).y),
+                           "axes": view_axes(cam), "chains": [dict(chain_info(cam, chain_positions(cam, co, ref), rel, pos, unit_mm), row=chain_row.get(ci, 0))
+                                      for ci, (vn, co, ref, rel, pos) in enumerate(chains) if vn == name], "chain_hs": chain_hs.get(name, []),
                            "grid": grid_ticks(cam, lo, hi, ctr, gstep, gorg) if name in gviews else None,
                            "labels": label_view(cam, lpts) if name in lviews else [],
                            "balloons": balloon_view(cam, bpts, r * 4, name != "Perspective") if name in bviews else [],
                            "manual": manual_view(cam, SPEC.get("manual_dims") or [], unit_mm, {"Face": "front", "Dessus": "top"}.get(name, "side"), ext)
                            if name != "Perspective" else [], "hatch": S.get("hatch"),
-                           "sec": sec and {"label": sec["label"], "hatch": sec["hatch"], "color": sec["color"]}, "cutlines": [],
+                           "angles": angle_view(cam, SPEC.get("angle_dims") or [], ext) if name != "Perspective" else [],
+                           "circ": circ_view(cam, SPEC.get("manual_dims") or [], ext) if name != "Perspective" else [],
+                           "chamfers": chamfer_view(cam, chamfers, ext) if name != "Perspective" and chamfers else [],
+                           "cyl": hole_view(cam, cyls, ext, lo, hi) if name != "Perspective" and cyls else ([], []),
+                           "threads": thread_view(cam, objs, ext, unit_mm, {o.name for o in objs})
+                           if name != "Perspective" and HO.get("fasteners", True) else {"ext": [], "int": []},
+                           "hpat": {i: (ARCH.get("hatches") or {}).get(objs[i].name) for i, _ in S.get("hatch") or []} if ARCH else {},
+                           "rooms": [((inv @ Vector(rm["p"])).xy[:], str(rm.get("name") or "")[:30], str(rm.get("area") or ""))
+                                     for rm in ARCH.get("rooms") or []] if ARCH and name == "Dessus" and sec else [],
+                           "sec": sec and {"label": sec["label"], "hatch": sec["hatch"], "color": sec["color"], "solid": sec.get("solid"), "title": sec.get("title")}, "cutlines": [],
                            "planes": [plansection.iso_plane(inv, sx, lo, hi, r) for sx in secs.values()]
                            if name == "Perspective" and iso_sec in ("cut", "page", "view") else []}
             if name == "Perspective" and iso_sec == "cut":
@@ -946,9 +1714,22 @@ def run(SPEC, OUT, progress=None):
             bpy.data.objects.remove(cam)
             steps.append(f"{label + ' · ' if label else ''}" + TX["view_done"].format(v=TX["views"][name], n=sum(len(x) for k in ("contour", "detail") for x in S.get(k, [])), t=time.time() - t))
         plansection.assign_cutlines(secs, sec_lines, drawn, side[0], warnings, TX)
+        done_sizes = set()
+        for n in [x for x in ("Face", side[0], "Dessus") if x in drawn]:
+            keep = []
+            for it in sorted(drawn[n].get("chamfers") or [], key=lambda it: it[1][0] - it[1][1]):
+                k = round(it[2] * unit_mm, 2)
+                if k not in done_sizes:
+                    done_sizes.add(k)
+                    keep.append(it)
+            drawn[n]["chamfers"] = keep
+        if HO.get("dims", True):
+            best = max((n for n in drawn if n != "Perspective"), key=lambda n: sum(1 for c in drawn[n]["cyl"][0] if c[2]), default=None)
+            if best and any(c[2] for c in drawn[best]["cyl"][0]):
+                drawn[best]["hole_dims"] = True
         if trimmed:
             infos.append(f"{label + ' : ' if label else ''}" + TX["hidden_trim_all"].format(n=trimmed, s="s" if trimmed > 1 else ""))
-        return {"label": label, "drawn": drawn, "scale": L["scale"], "pages": L["pages"], "note": L["note"], "real": real, "lo": lo, "hi": hi,
+        return {"label": label, "drawn": drawn, "scale": L["scale"], "pages": L["pages"], "note": L["note"], "real": real, "real_body": real_body, "lo": lo, "hi": hi,
                 "hidden": hidden and any(d["cache"] for d in drawn.values()), "trimmed": trimmed, "steps": steps, "objects": len(objs), "unit_mm": unit_mm, "bom": bom,
                 "annex": annex, "bom_ext": bext}
 
@@ -960,6 +1741,16 @@ def run(SPEC, OUT, progress=None):
         gi[0] = i
         G.append(group(g.get("only"), g.get("hide"), g.get("name") or "", g.get("views"), g.get("bom", True)))
     steps = [st for g in G for st in g["steps"]]
+    seen_bom = []
+    for g in G:
+        if g.get("bom") and g.get("annex"):
+            key = (tuple(map(tuple, g["bom"])), repr(g.get("bom_ext")))
+            prev = next((h for k, h in seen_bom if k == key), None)
+            if prev is not None:
+                g["annex_of"] = prev
+                g["pages"] = [pg for pg in g["pages"] if not pg.get("annex")]
+            else:
+                seen_bom.append((key, g))
     jobs = [(g, pg) for g in G for pg in g["pages"]]
     notes = [(f"{g['label']} : " if g["label"] else "") + g["note"] for g in G if g["note"]]
     steps += notes
@@ -976,7 +1767,8 @@ def run(SPEC, OUT, progress=None):
         k = v["w"] / max(ex[1] - ex[0], 1e-9) if v["name"] == "Perspective" else k_paper
         for layer, lw, dash in (("cache", W["cache"], (12 * W["cache"], 3 * W["cache"])), ("detail", W["detail"], None), ("contour", W["contour"], None)):
             P.layer = "HIDDEN" if layer == "cache" else "VISIBLE"
-            for st in D[layer]:
+            lines = []
+            for st in (join_strokes(merge_collinear(D[layer], 0.08 / max(k, 1e-9))) if dash else D[layer]):
                 pts, last = [], None
                 for x, y in st:
                     q = (v["x"] + (x - ex[0]) * k, v["y"] + (ex[3] - y) * k)
@@ -984,11 +1776,37 @@ def run(SPEC, OUT, progress=None):
                         pts.append(q)
                         last = q
                 if len(pts) >= 2:
+                    lines.append((pts, sum(math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1))))
+            if lines:
+                key = lambda q: (round(q[0] / 0.1), round(q[1] / 0.1))
+                ends = {}
+                for pts, _L in lines:
+                    for q in (pts[0], pts[-1]):
+                        ends[key(q)] = ends.get(key(q), 0) + 1
+                short = 1.0 if dash else 0.6
+                for pts, L in lines:
+                    if L < short and ends[key(pts[0])] <= 1 and ends[key(pts[-1])] <= (2 if key(pts[0]) == key(pts[-1]) else 1):
+                        continue
                     P.poly(pts, lw, dash)
         H = D.get("hatch")
         if H:
             paper = [(i, [[(v["x"] + (x - ex[0]) * k, v["y"] + (ex[3] - y) * k) for x, y in lp] for lp in lps]) for i, lps in H]
-            plansection.draw_hatch(P, paper, D["sec"]["hatch"], D["sec"]["color"], W["detail"], W["contour"])
+            solid = D["sec"].get("solid")
+            if solid == "auto":
+                solid = bool(scale) and scale <= 0.0101
+            plansection.draw_hatch(P, paper, D["sec"]["hatch"], D["sec"]["color"], W["detail"], W.get("cut", W["contour"]), solid, D.get("hpat"))
+        FVd = D.get("fv")
+        if FVd:
+            tp = lambda x, y: (v["x"] + (x - ex[0]) * k, v["y"] + (ex[3] - y) * k)
+            P.layer = "HATCH"
+            for poly in FVd.get("mask", []):
+                P.mask([tp(x, y) for x, y in poly])
+            for layer, lw in (("detail", W["detail"]), ("contour", W["contour"])):
+                P.layer = "VISIBLE"
+                for st in FVd.get(layer, []):
+                    pts = [tp(x, y) for x, y in st]
+                    if len(pts) >= 2:
+                        P.poly(pts, lw)
         P.layer = "FRAME"
 
     def cutline_of(P, v, cl):
@@ -1078,16 +1896,18 @@ def run(SPEC, OUT, progress=None):
             if p:
                 return (o["x"] - 2, o["y"] - top - 1, o["x"] + o["w"] + 2, o["y"] + o["h"] + 2)
             dw = drawn.get(o["name"], {})
-            below = D1 + 5 + sum(CHAIN_ROW + (POS_ROW if ch["pos"] else 0) for ch in dw.get("chains", []))
+            below = D1 + 5 + sum(dw.get("chain_hs") or [])
             nh = nv = 0
-            for (xa, ya), (xb, yb), _ in dw.get("manual") or []:
+            for (xa, ya), (xb, yb), *_ in dw.get("manual") or []:
                 dx, dy = (xb - xa) * k_paper, (yb - ya) * k_paper
                 ln = math.hypot(dx, dy)
                 if ln >= 1:
                     nh += abs(dy) < 0.02 * ln
                     nv += abs(dx) < 0.02 * ln and abs(dy) >= 0.02 * ln
             below += 7 * nh + (2 if nh else 0)
-            return (o["x"] - max(gtop + 1, 7 * nv + (4 if nv else 0)), o["y"] - top - 1, o["x"] + o["w"] + D1 + 5, o["y"] + o["h"] + below)
+            bx = CHAIN_ROW if dw.get("body_ext") else 0
+            bx += CHAIN_ROW if dw.get("hole_dims") and not SPEC.get("hole_table") else 0
+            return (o["x"] - max(gtop + 1, 7 * nv + (4 if nv else 0)), o["y"] - top - 1, o["x"] + o["w"] + D1 + 5 + bx, o["y"] + o["h"] + below + bx)
         own = zone(v)
         obst = [zone(o) for o in pg["views"] if o is not v and o["name"] in drawn and "plane" not in o] + [(tb_x0, tb_top, P.w, P.h)]
         if own[0] < v["x"] - gtop - 1:
@@ -1189,11 +2009,17 @@ def run(SPEC, OUT, progress=None):
         a, b = Vector(a), Vector(b)
         d = b - a
         vert = abs(d.x) < 0.02 * d.length
+        boxed = t.startswith("\x01")
+        t = t.lstrip("\x01")
 
         def put(c, rot=False):
             L = text_width(t) * DT + 0.6
             w, h = (DT, L) if rot else (L, DT)
             P.blank(c.x - w / 2, c.y - h / 2, w, h)
+            if boxed:
+                m = 0.4
+                P.poly([(c.x - w / 2 - m, c.y - h / 2 - m), (c.x + w / 2 + m, c.y - h / 2 - m), (c.x + w / 2 + m, c.y + h / 2 + m),
+                        (c.x - w / 2 - m, c.y + h / 2 + m)], W["detail"], closed=True)
             P.text(c.x, c.y, t, DT, "center", rot=rot)
         if ASME:
             tw = text_width(t) * DT + 2
@@ -1206,7 +2032,14 @@ def run(SPEC, OUT, progress=None):
             put(c)
             return
         out = d.length < 2 * ARROW[0] + 1
-        P.arrow(*a, *b, out=out)
+        if ARCH:
+            u = d / max(d.length, 1e-9)
+            P.line(*(a - u * 2), *(b + u * 2), W["detail"])
+            for q in (a, b):
+                P.line(q.x - 0.9 * (u.x + u.y), q.y - 0.9 * (u.y - u.x), q.x + 0.9 * (u.x + u.y), q.y + 0.9 * (u.y - u.x), 0.35)
+            out = False
+        else:
+            P.arrow(*a, *b, out=out)
         c = (a + b) / 2
         tw = text_width(t) * DT + 0.6
         if d.length < tw + 1:
@@ -1226,6 +2059,32 @@ def run(SPEC, OUT, progress=None):
     def dims_of(P, v, w, h, horiz=True, vert=True):
         x0, y0, vw, vh = v["x"], v["y"], v["w"], v["h"]
         yd, xd = y0 + vh + D1, x0 + vw + D1
+        D = drawn[v["name"]]
+        be, bd = D.get("body_ext"), body_dims.get(v["name"])
+        extra = 0
+        if be and bd:
+            ex = D["ext"]
+            bx0, bx1 = x0 + (be[0] - ex[0]) * k_paper, x0 + (be[1] - ex[0]) * k_paper
+            byt, byb = y0 + (ex[3] - be[3]) * k_paper, y0 + (ex[3] - be[2]) * k_paper
+            if horiz and (abs(bx0 - x0) > 0.05 or abs(bx1 - x0 - vw) > 0.05):
+                ext_line(P, bx0, byb, bx0, yd)
+                ext_line(P, bx1, byb, bx1, yd)
+                dimline(P, (bx0, yd), (bx1, yd), dual(bd[0]), (0, -1))
+                yd += CHAIN_ROW
+                extra = CHAIN_ROW
+                ext_line(P, x0, y0 + vh, x0, yd)
+                ext_line(P, x0 + vw, y0 + vh, x0 + vw, yd)
+                dimline(P, (x0, yd), (x0 + vw, yd), "(" + dual(w) + ")", (0, -1))
+                horiz = False
+            if vert and (abs(byt - y0) > 0.05 or abs(byb - y0 - vh) > 0.05):
+                ext_line(P, x0 + vw, byt, xd, byt)
+                ext_line(P, x0 + vw, byb, xd, byb)
+                dimline(P, (xd, byb), (xd, byt), dual(bd[1]), (-1, 0))
+                xd += CHAIN_ROW
+                ext_line(P, x0 + vw, y0, xd, y0)
+                ext_line(P, x0 + vw, y0 + vh, xd, y0 + vh)
+                dimline(P, (xd, y0 + vh), (xd, y0), "(" + dual(h) + ")", (-1, 0))
+                vert = False
         if horiz:
             ext_line(P, x0, y0 + vh, x0, yd)
             ext_line(P, x0 + vw, y0 + vh, x0 + vw, yd)
@@ -1234,12 +2093,363 @@ def run(SPEC, OUT, progress=None):
             ext_line(P, x0 + vw, y0, xd, y0)
             ext_line(P, x0 + vw, y0 + vh, xd, y0 + vh)
             dimline(P, (xd, y0 + vh), (xd, y0), dual(h), (-1, 0))
+        return extra
+
+    def arch_marks(P, v):
+        D = drawn[v["name"]]
+        if not D.get("basis"):
+            return
+        r, u, f = (Vector(c) for c in D["basis"])
+        if D.get("sec") and ARCH.get("north") is not None and abs(f.z) > 0.9:
+            a = math.radians(float(ARCH["north"]))
+            n = Vector((math.sin(a), math.cos(a), 0))
+            dx, dy = n.dot(r), -n.dot(u)
+            ln = math.hypot(dx, dy) or 1
+            dx, dy = dx / ln, dy / ln
+            R = 6
+            cx, cy = v["x"] + v["w"] + D1 + 16, v["y"] + R + 2
+            circle(P, cx, cy, R, 0.25)
+            tip, tail, side = (cx + dx * R, cy + dy * R), (cx - dx * R, cy - dy * R), (-dy * R * 0.45, dx * R * 0.45)
+            P.tri([tip, (tail[0] + side[0], tail[1] + side[1]), (cx - dx * R * 0.4, cy - dy * R * 0.4)])
+            P.poly([tip, (tail[0] - side[0], tail[1] - side[1]), (cx - dx * R * 0.4, cy - dy * R * 0.4)], 0.25, closed=True)
+            P.text(cx + dx * (R + 3), cy + dy * (R + 3), "N", 3.5, "center", bold=True)
+        zc, ex = D.get("zcam"), D["ext"]
+        if D.get("rooms"):
+            P.layer = "TEXT"
+            for (x, y), nm, ar in D["rooms"]:
+                px, py = v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper
+                wd = max(text_width(nm) * 2.5, text_width(ar) * 2.2) + 1.6
+                P.blank(px - wd / 2, py - 3.2, wd, 6.4 if ar else 3.6)
+                P.text(px, py - 0.6 if ar else py + 0.9, nm, 2.5, "center", bold=True)
+                if ar:
+                    P.text(px, py + 2.4, ar, 2.2, "center", grey=True)
+            P.layer = "DIMENSIONS"
+        if zc and abs(u.z) > 0.9 and ARCH.get("levels"):
+            z0 = float(ARCH.get("zero") or 0)
+            x0 = v["x"] - 3
+            for lv in ARCH["levels"]:
+                z = float(lv.get("z", 0))
+                y = v["y"] + (ex[3] - (zc[0] * z + zc[1])) * k_paper
+                mval = (z - z0) * unit_mm / 1000
+                t = "±0.00" if abs(mval) < 0.005 else f"{mval:+.2f}"
+                t = t.replace(".", ",") if lang == "fr" else t
+                P.line(x0 - 18, y, x0, y, W["detail"])
+                P.tri([(x0 - 14, y), (x0 - 15.4, y - 2.2), (x0 - 12.6, y - 2.2)])
+                P.text(x0 - 11.5, y - 1.4, t, 2.5, bold=True)
+                if lv.get("name"):
+                    P.text(x0 - 18, y + 2, str(lv["name"])[:30], 1.8, grey=True)
+
+    def axes_of(P, v, ex):
+        circles, axes = drawn[v["name"]].get("cyl") or ([], [])
+        paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
+        P.layer = "VISIBLE"
+        lw = W["detail"]
+        top = {}
+        pile = stacks([(c[0][0] * k_paper, c[0][1] * k_paper) for c in circles], 0.2)
+        for c, k in zip(circles, pile):
+            top[k] = max(top.get(k, (-1e9, 0)), (round(c[6], 6) if len(c) > 6 else 0.0, c[1]))
+        for ((x, y), r, *rest), k_ in zip(circles, pile):
+            c, rp = paper(x, y), r * k_paper
+            if rp < 0.8:
+                continue
+            for ux, uy in ((1, 0), (0, 1)):
+                plansection.dashdot(P, c.x - ux * (rp + 2), c.y - uy * (rp + 2), ux, uy, 0, 2 * rp + 4, lw)
+            fh = rest[3] if len(rest) > 3 else None
+            seen = top[k_]
+            if isinstance(fh, dict) and fh.get("type") in ("TAPPED", "INSERT") and not fh.get("fitted") and (round(rest[4], 6) if len(rest) > 4 else 0.0, r) >= seen:
+                try:
+                    dn = float(str(fh.get("thread", "")).lstrip("M"))
+                except ValueError:
+                    continue
+                if fh.get("type") == "INSERT":
+                    continue
+                R = dn / 2 / unit_mm * k_paper
+                pts = [(c.x + R * math.cos(math.radians(a)), c.y - R * math.sin(math.radians(a))) for a in range(100, 371, 10)]
+                P.poly(pts, W["detail"])
+        th = drawn[v["name"]].get("threads") or {}
+        for (xa, ya), (xb, yb) in th.get("ext", []):
+            a, b = paper(xa, ya), paper(xb, yb)
+            P.line(a.x, a.y, b.x, b.y, W["detail"])
+        if th.get("int") and SPEC.get("hidden"):
+            P.layer = "HIDDEN"
+            for (xa, ya), (xb, yb) in th["int"]:
+                a, b = paper(xa, ya), paper(xb, yb)
+                P.poly([(a.x, a.y), (b.x, b.y)], W["cache"], dash=(12 * W["cache"], 3 * W["cache"]))
+            P.layer = "VISIBLE"
+        for (xa, ya), (xb, yb), r in axes:
+            a, b = paper(xa, ya), paper(xb, yb)
+            d = b - a
+            if d.length < 1 or r * k_paper < 0.5:
+                continue
+            u = d / d.length
+            plansection.dashdot(P, a.x - u.x * 2, a.y - u.y * 2, u.x, u.y, 0, d.length + 4, lw)
+        P.layer = "DIMENSIONS"
+
+    def val(v):
+        return f"{fmt(v)} [{fmt2(v)}]" if unit2 else fmt(v)
+
+    def callout(fh):
+        t, g = fh.get("type"), lambda k: float(fh.get(k) or 0)
+        deep = "" if fh.get("through") else f" ↧ {val(g('depth'))}"
+        if t == "TAPPED":
+            return f"{fh.get('thread', '')}" + ("" if fh.get("through") else f" ↧ {val(g('thread_depth'))}")
+        if t == "INSERT":
+            return f"Ø{val(g('dia'))} ↧ {val(g('depth'))} ({fh.get('thread', '')})"
+        if t == "PIN_HOLE":
+            return f"Ø{val(g('dia'))}" + (f" {fh['fit']}" if fh.get("fit") else "") + deep
+        if t == "PILOT":
+            return f"Ø{val(g('dia'))}{deep} ({fh.get('thread', '')})"
+        if t == "COUNTERBORE":
+            return f"Ø{val(g('dia'))}{deep} ⌴ Ø{val(g('cb_dia'))} ↧ {val(g('cb_depth'))}"
+        if t == "COUNTERSINK":
+            return f"Ø{val(g('dia'))}{deep} ⌵ Ø{val(g('csk_dia'))} × {int(g('csk_angle') or 90)}°"
+        return f"Ø{val(g('dia'))}{deep}"
+
+    def holes_of(P, v, ex, yrow):
+        circles = [c for c in (drawn[v["name"]].get("cyl") or ([], []))[0] if c[2]]
+        paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
+        big = 0.25 * min(v["w"], v["h"])
+        circles = [c for c in circles if 0.8 <= c[1] * k_paper and 2 * c[1] * k_paper <= big and (len(c) < 6 or c[5] != "seat")]
+        if any(len(c) > 5 and c[5] for c in circles):
+            keep = {}
+            pile = stacks([(c[0][0] * k_paper, c[0][1] * k_paper) for c in circles], 0.2)
+            for c, k in zip(circles, pile):
+                rank = (round(c[6], 6) if len(c) > 6 else 0.0, c[1], bool(c[5]))
+                if k not in keep or rank > keep[k][0]:
+                    keep[k] = (rank, c)
+            keep = {k: v[1] for k, v in keep.items()}
+            circles = list(keep.values())
+        pts = [(paper(*xy), r) for xy, r, *_ in circles]
+        calls = {id(it): callout(c[5]) for it, c in zip(pts, circles) if len(c) > 5 and isinstance(c[5], dict)}
+        wx = [c[3] for c in circles]
+        wy = [c[4] for c in circles]
+        if not pts:
+            return
+        if SPEC.get("hole_table"):
+            key = lambda i: calls.get(id(pts[i])) or round(2 * pts[i][1] * unit_mm, 2)
+            dias = sorted({key(i) for i in range(len(pts))}, key=lambda v: (isinstance(v, str), str(v) if isinstance(v, str) else v))
+            rows, k = [], {}
+            order = sorted(range(len(pts)), key=lambda i: (dias.index(key(i)), round(wy[i], 6), round(wx[i], 6)))
+            for i in order:
+                p, r = pts[i]
+                d = round(2 * r * unit_mm, 2)
+                L = "ABCDEFGHJKLMNPQRSTUVWXYZ"[dias.index(key(i)) % 24]
+                k[L] = k.get(L, 0) + 1
+                tag = f"{L}{k[L]}"
+                q = p + Vector((0.7071, -0.7071)) * (r * k_paper + 1.2)
+                tw = text_width(tag) * 2.5
+                P.blank(q.x - 0.3, q.y - 2.6, tw + 0.6, 2.8)
+                P.text(q.x, q.y - 1.2, tag, 2.5, bold=True)
+                rows.append((tag, round(wx[i] * unit_mm, 4), round(wy[i] * unit_mm, 4), d, calls.get(id(pts[i]))))
+            HOLE_ROWS[:] = rows[:HOLE_TABLE_MAX]
+            return
+        groups, named = [], {}
+        for it in sorted(pts, key=lambda it: -it[1]):
+            r = it[1]
+            if id(it) in calls:
+                t_ = calls[id(it)]
+                if t_ in named:
+                    named[t_][1].append(it)
+                else:
+                    named[t_] = (r, [it], t_)
+                    groups.append(named[t_])
+                continue
+            g = next((g for g in groups if len(g) == 2 and abs(g[0] - r) <= 0.03 * g[0]), None)
+            if g:
+                g[1].append(it)
+            else:
+                groups.append((r, [it]))
+        groups = sorted(groups, key=lambda g: (-len(g[1]), g[0]))
+        groups = [g for g in groups if len(g) > 2] + [g for g in groups if len(g) == 2][:max(0, HOLE_GROUPS - sum(len(g) > 2 for g in groups))]
+        kept = set()
+        circles_box = [(p.x - r * k_paper, p.y - r * k_paper, p.x + r * k_paper, p.y + r * k_paper) for p, r in pts]
+        x0, y0, vw, vh = v["x"], v["y"], v["w"], v["h"]
+        bands = [(x0 + vw + 0.5, y0 - 2, x0 + vw + D1 + 3 * CHAIN_ROW, y0 + vh + 2),
+                 (x0 - 2, y0 + vh + 0.5, x0 + vw + 2, y0 + vh + D1 + 3 * CHAIN_ROW),
+                 (x0 + vw / 2 - 45, y0 - (planlayout.TOP + 2), x0 + vw / 2 + 45, y0 - 0.5)]
+        bands += [(o["x"] - 2, o["y"] - planlayout.TOP - 2, o["x"] + o["w"] + D1 + 6, o["y"] + o["h"] + D1 + 6)
+                  for o in pg["views"] if o is not v and "w" in o]
+        labels = []
+        hit = lambda a, b: a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+        L_, s2 = ARROW
+        dirs = [Vector((math.cos(math.radians(a_)), -math.sin(math.radians(a_)))) for a_ in (45, 135, -45, -135, 60, 120, -60, -120, 30, 150)]
+        for r0, g, *named_t in groups:
+            t = (f"{len(g)} × " if len(g) > 1 else "") + (named_t[0] if named_t else "Ø" + dual(round(2 * r0 * unit_mm, 2)))
+            tw = text_width(t) * DT
+            best, cands = None, []
+            for p, r in sorted(g, key=lambda it: (it[0].y, -it[0].x)):
+                rp = r * k_paper
+                own = (p.x - rp, p.y - rp, p.x + rp, p.y + rp)
+                for ln in (7, 12, 18):
+                    for u in dirs:
+                        tip, elbow = p + u * rp, p + u * (rp + ln)
+                        sgn = 1 if u.x >= 0 else -1
+                        box = (min(elbow.x, elbow.x + sgn * (tw + 1.5)) - 0.5, elbow.y - DT - 1.2, max(elbow.x, elbow.x + sgn * (tw + 1.5)) + 0.5, elbow.y + 0.3)
+                        if not (planlayout.MARGIN_L + 1 < box[0] and box[2] < P.w - planlayout.MARGIN - 1 and planlayout.MARGIN + 1 < box[1]):
+                            continue
+                        mid = (min(tip.x, elbow.x), min(tip.y, elbow.y), max(tip.x, elbow.x), max(tip.y, elbow.y))
+                        n_lab = sum(hit(box, o) for o in labels)
+                        n_band = sum(hit(box, o) for o in bands)
+                        n_circ = sum(hit(box, o) for o in circles_box) + sum(hit(mid, o) for o in circles_box if o != own)
+                        cands.append(((n_lab, n_band, n_circ, ln), (p, rp, u, ln, sgn, box)))
+            free = [c for c in cands if c[0][0] == 0 and c[0][1] == 0]
+            if not free:
+                continue
+            best = min(free, key=lambda it: it[0])[1]
+            p, rp, u, ln, sgn, box = best
+            labels.append(box)
+            kept |= {id(it) for it in g}
+            tip, elbow = p + u * rp, p + u * (rp + ln)
+            nr = Vector((-u.y, u.x))
+            P.tri([tuple(tip), tuple(tip + u * L_ + nr * L_ * math.tan(s2)), tuple(tip + u * L_ - nr * L_ * math.tan(s2))])
+            P.line(*tip, *elbow, W["detail"])
+            P.line(*elbow, elbow.x + sgn * (tw + 1.5), elbow.y, W["detail"])
+            cx = elbow.x + sgn * (0.8 + tw / 2)
+            P.blank(cx - tw / 2 - 0.3, elbow.y - DT - 0.8, tw + 0.6, DT)
+            P.text(cx, elbow.y - DT / 2 - 0.8, t, DT, "center")
+        def need(w):
+            v = round(w * unit_mm, 4)
+            return text_width(fmt(v) + (f" [{fmt2(v)}]" if unit2 else "")) * DT + 2
+
+        def stations(paper_pos, world):
+            cand = [(q, w) for q, w in sorted(zip(paper_pos, world), key=lambda it: it[1]) if w * k_paper > 0.3]
+            out, last, short_ok = [(None, 0.0)], 0.0, True
+            for i, (q, w) in enumerate(cand):
+                seg = w - last
+                if seg * k_paper < 0.05 or len(out) > 8:
+                    continue
+                if seg * k_paper >= need(seg):
+                    out.append((q, w))
+                    last, short_ok = w, True
+                elif seg * k_paper >= 2 * ARROW[0] + 1 and short_ok:
+                    nxt = next((w2 for _, w2 in cand[i + 1:] if (w2 - w) * k_paper >= 0.05), None)
+                    if nxt is None or (nxt - w) * k_paper >= need(nxt - w) + need(seg):
+                        out.append((q, w))
+                        last, short_ok = w, False
+            return out
+        keep_i = [i for i, it in enumerate(pts) if id(it) in kept]
+        pk, wxk, wyk = [pts[i] for i in keep_i], [wx[i] for i in keep_i], [wy[i] for i in keep_i]
+        if not pk:
+            return
+        st = stations([p.x for p, _ in pk], wxk)
+        xp = [x0] + [q for q, _ in st[1:]]
+        for x in xp[1:]:
+            ext_line(P, x, max(p.y + r * k_paper for p, r in pts if abs(p.x - x) < 0.06), x, yrow)
+        for k_ in range(1, len(st)):
+            dimline(P, (xp[k_ - 1], yrow), (xp[k_], yrow), dual(round((st[k_][1] - st[k_ - 1][1]) * unit_mm, 4)), (0, -1))
+        D = drawn[v["name"]]
+        be = D.get("body_ext")
+        vx = CHAIN_ROW if be and (abs(be[2] - D["ext"][2]) * k_paper > 0.05 or abs(be[3] - D["ext"][3]) * k_paper > 0.05) else 0
+        bot, xr = y0 + vh, x0 + vw + D1 + CHAIN_ROW + vx
+        st = stations([p.y for p, _ in pk], wyk)
+        yp = [bot] + [q for q, _ in st[1:]]
+        for y in yp[1:]:
+            ext_line(P, max(p.x + r * k_paper for p, r in pts if abs(p.y - y) < 0.06), y, xr, y)
+        for k_ in range(1, len(st)):
+            dimline(P, (xr, yp[k_ - 1]), (xr, yp[k_]), dual(round((st[k_][1] - st[k_ - 1][1]) * unit_mm, 4)), (-1, 0))
+
+    def circ_of(P, v, ex):
+        paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
+        L_, s2 = ARROW
+        for (cx, cy), (px, py), r, kind, tol, *deco in drawn[v["name"]].get("circ") or []:
+            c, p = paper(cx, cy), paper(px, py)
+            rp = r * k_paper
+            u = p - c
+            if u.length < 1e-6:
+                u = Vector((0.7071, -0.7071))
+            u.normalize()
+            tip = c + u * rp
+            nr = Vector((-u.y, u.x))
+            if kind == "radius":
+                P.line(*c, *(tip + u * 6), W["detail"])
+                P.tri([tuple(tip), tuple(tip - u * L_ + nr * L_ * math.tan(s2)), tuple(tip - u * L_ - nr * L_ * math.tan(s2))])
+                t = "R" + dual(r * unit_mm)
+            else:
+                P.line(*tip, *(tip + u * 7), W["detail"])
+                P.tri([tuple(tip), tuple(tip + u * L_ + nr * L_ * math.tan(s2)), tuple(tip + u * L_ - nr * L_ * math.tan(s2))])
+                t = "Ø" + dual(2 * r * unit_mm)
+            t = deco_text(t, tol_text(tol, (r if kind == "radius" else 2 * r) * unit_mm), deco[0] if deco else None)
+            boxed = t.startswith("\x01")
+            t = t.lstrip("\x01")
+            elbow = tip + u * (6 if kind == "radius" else 7)
+            tw = text_width(t) * DT
+            sgn = 1 if u.x >= 0 else -1
+            P.line(*elbow, elbow.x + sgn * (tw + 1.5), elbow.y, W["detail"])
+            tx = elbow.x + sgn * (0.8 + tw / 2)
+            P.blank(tx - tw / 2 - 0.3, elbow.y - DT - 0.8, tw + 0.6, DT)
+            if boxed:
+                P.poly([(tx - tw / 2 - 0.6, elbow.y - DT - 1.1), (tx + tw / 2 + 0.6, elbow.y - DT - 1.1), (tx + tw / 2 + 0.6, elbow.y - 0.5),
+                        (tx - tw / 2 - 0.6, elbow.y - 0.5)], W["detail"], closed=True)
+            P.text(tx, elbow.y - DT / 2 - 0.8, t, DT, "center")
+
+    def chamfers_of(P, v, ex):
+        paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
+        for (x, y), (nx, ny), leg in drawn[v["name"]].get("chamfers") or []:
+            m = paper(x, y)
+            u = Vector((nx, -ny))
+            if u.length < 1e-9:
+                continue
+            u.normalize()
+            tip, elbow = m, m + u * 8
+            L_, s2 = ARROW
+            nr = Vector((-u.y, u.x))
+            P.tri([tuple(tip), tuple(tip + u * L_ + nr * L_ * math.tan(s2)), tuple(tip + u * L_ - nr * L_ * math.tan(s2))])
+            t = dual(leg * unit_mm) + (" X 45°" if ASME else " × 45°")
+            tw = text_width(t) * DT
+            sgn = 1 if u.x >= 0 else -1
+            if sgn < 0 and elbow.x - tw - 3 < planlayout.MARGIN_L + 2:
+                sgn = 1
+            elif sgn > 0 and elbow.x + tw + 3 > P.w - planlayout.MARGIN - 2:
+                sgn = -1
+            P.line(*tip, *elbow, W["detail"])
+            P.line(*elbow, elbow.x + sgn * (tw + 1.5), elbow.y, W["detail"])
+            cx = elbow.x + sgn * (0.8 + tw / 2)
+            P.blank(cx - tw / 2 - 0.3, elbow.y - DT - 0.8, tw + 0.6, DT)
+            P.text(cx, elbow.y - DT / 2 - 0.8, t, DT, "center")
+
+    def angle_of(P, v, angs, ex):
+        paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
+        for (xo, yo), (xa, ya), (xb, yb), deg in angs:
+            o, a, b = paper(xo, yo), paper(xa, ya), paper(xb, yb)
+            la, lb = (a - o).length, (b - o).length
+            if min(la, lb) < 1:
+                continue
+            r = max(8, min(0.6 * min(la, lb), 22))
+            t0, t1 = math.atan2(a.y - o.y, a.x - o.x), math.atan2(b.y - o.y, b.x - o.x)
+            sweep = (t1 - t0 + math.pi) % (2 * math.pi) - math.pi
+            for q, L in ((a, la), (b, lb)):
+                if L < r + 1:
+                    u = (q - o) / L
+                    ext_line(P, *q, *(o + u * (r + EXT_OVER)))
+            n = max(8, int(abs(sweep) / math.radians(4)))
+            pts = [(o.x + r * math.cos(t0 + sweep * i / n), o.y + r * math.sin(t0 + sweep * i / n)) for i in range(n + 1)]
+            P.poly(pts, W["detail"])
+            arc_len = r * abs(sweep)
+            L_, s2 = ARROW
+            out = arc_len < 2 * L_ + 1
+            sg = 1 if sweep > 0 else -1
+            for t, dirn in ((t0, sg), (t0 + sweep, -sg)):
+                tip = Vector((o.x + r * math.cos(t), o.y + r * math.sin(t)))
+                tg = Vector((-math.sin(t), math.cos(t))) * (dirn if not out else -dirn)
+                bk = tip + tg * L_
+                nr = Vector((math.cos(t), math.sin(t)))
+                P.tri([tuple(tip), tuple(bk + nr * L_ * math.tan(s2)), tuple(bk - nr * L_ * math.tan(s2))])
+                if out:
+                    P.line(*tip, *(tip + tg * (L_ + 2)), W["detail"])
+            val = f"{deg:.1f}".rstrip("0").rstrip(".") + "°"
+            val = val.replace(".", ",") if lang == "fr" else val
+            tm = t0 + sweep / 2
+            tw = text_width(val) * DT
+            c = o + Vector((math.cos(tm), math.sin(tm))) * (r + DT * 0.6 + abs(math.cos(tm)) * tw / 2 + 0.6)
+            P.blank(c.x - tw / 2 - 0.3, c.y - DT / 2, tw + 0.6, DT)
+            P.text(c.x, c.y, val, DT, "center")
 
     def manual_of(P, v, mds, ex, ybase):
         paper = lambda x, y: Vector((v["x"] + (x - ex[0]) * k_paper, v["y"] + (ex[3] - y) * k_paper))
         nh = nv = 0
-        for (xa, ya), (xb, yb), val in mds:
+        for (xa, ya), (xb, yb), val, *pre in mds:
             pa, pb = paper(xa, ya), paper(xb, yb)
+            txt = deco_text(symbol_text(pre[0] if pre else "", dual(val)), tol_text(pre[1] if len(pre) > 1 else None, val), pre[2] if len(pre) > 2 else None)
             d = pb - pa
             if d.length < 1:
                 continue
@@ -1248,13 +2458,13 @@ def run(SPEC, OUT, progress=None):
                 y = ybase + 7 * nh
                 for p in (pa, pb):
                     ext_line(P, p.x, p.y, p.x, y)
-                dimline(P, (min(pa.x, pb.x), y), (max(pa.x, pb.x), y), dual(val), (0, -1))
+                dimline(P, (min(pa.x, pb.x), y), (max(pa.x, pb.x), y), txt, (0, -1))
             elif abs(d.x) < 0.02 * d.length:
                 nv += 1
                 x = v["x"] - 7 * nv
                 for p in (pa, pb):
                     ext_line(P, p.x, p.y, x, p.y)
-                dimline(P, (x, max(pa.y, pb.y)), (x, min(pa.y, pb.y)), dual(val), (-1, 0))
+                dimline(P, (x, max(pa.y, pb.y)), (x, min(pa.y, pb.y)), txt, (-1, 0))
             else:
                 n = Vector((-d.y, d.x)) / d.length
                 if n.dot((pa + pb) / 2 - Vector((v["x"] + v["w"] / 2, v["y"] + v["h"] / 2))) < 0:
@@ -1262,7 +2472,7 @@ def run(SPEC, OUT, progress=None):
                 a1, b1 = pa + n * 7, pb + n * 7
                 ext_line(P, *pa, *a1)
                 ext_line(P, *pb, *b1)
-                dimline(P, a1, b1, dual(val), n)
+                dimline(P, a1, b1, txt, n)
 
     def chain_of(P, v, ch, y, ex):
         segs = ch["segs"]
@@ -1360,9 +2570,12 @@ def run(SPEC, OUT, progress=None):
         drawn, scale, real, lo, hi, hidden, unit_mm = g["drawn"], g["scale"], g["real"], g["lo"], g["hi"], g["hidden"], g["unit_mm"]
         k_paper = scale * unit_mm
         real_dims = {"Face": (real.x, real.z), "Gauche": (real.y, real.z), "Droite": (real.y, real.z), "Dessus": (real.x, real.y)}
+        rb = g.get("real_body")
+        body_dims = {"Face": (rb.x, rb.z), "Gauche": (rb.y, rb.z), "Droite": (rb.y, rb.z), "Dessus": (rb.x, rb.y)} if rb is not None else {}
         sw, sh, m = pg["w"], pg["h"], planlayout.MARGIN
         P = Sheet(sw, sh)
         DIMV.clear()
+        HOLE_ROWS.clear()
         P.style = ART
         if plain:
             P.poly([(m, m), (sw - m, m), (sw - m, sh - m), (m, sh - m)], 0.5, closed=True)
@@ -1371,7 +2584,9 @@ def run(SPEC, OUT, progress=None):
         tb_x0 = sw - m - min(planlayout.TB_W, sw - 2 * m)
         tb_top = sh - m - planlayout.TB_H - XT["inside"] - planlayout.NOTES - XT["above"] - bom_height(g["bom"], g["annex"]) - 3
         notitle = title == "—" and g["label"]
-        P.text(sw / 2, m + 7, (g["label"] if notitle else title).upper(), 5, "center", bold=True)
+        head = g["label"] if notitle else title
+        if head != "—":
+            P.text(sw / 2, m + 7, head.upper(), 5, "center", bold=True)
         sub = project if notitle else f"{g['label']} · {project}" if g["label"] else project
         if sub.endswith(" · —"):
             sub = sub[:-4]
@@ -1383,7 +2598,7 @@ def run(SPEC, OUT, progress=None):
             pg["views"] = [{"name": "Perspective", "x": x, "y": y, "w": w, "h": h, "plane": i, "ext": ex}
                            for i, (x, y, w, h) in enumerate(plansection.plane_cells(len(drawn["Perspective"]["planes"]), (ex[1] - ex[0]) / max(ex[3] - ex[2], 1e-9),
                                                                         planlayout.zones(sw, sh)[0], tb_x0, tb_top, planlayout.TOP))]
-        if sub == "—" and notitle:
+        if sub == "—":
             sub = ""
         if sub:
             P.text(sw / 2, m + 13, sub, 3.5, "center")
@@ -1422,12 +2637,14 @@ def run(SPEC, OUT, progress=None):
             persp = v["name"] == "Perspective"
             cx = v["x"] + v["w"] / 2
             head = TX[v["name"]]
+            vkey = {"Face": "front", "Dessus": "top", "Perspective": "iso"}.get(v["name"], "side")
+            head = str((SPEC.get("view_names") or {}).get(vkey) or head)[:60]
             ty0 = v["y"] - (0 if persp else gtop)
             if btop is not None:
                 ty0 = min(ty0, btop - 1)
             titled = persp or SPEC.get("view_titles", True)
             if drawn[v["name"]].get("sec"):
-                head, titled = TX["section"].format(l=drawn[v["name"]]["sec"]["label"]), True
+                head, titled = drawn[v["name"]]["sec"].get("title") or TX["section"].format(l=drawn[v["name"]]["sec"]["label"]), True
             tint = (drawn[v["name"]].get("sec") or {}).get("color")
             if "plane" in v:
                 head, tint = TX["plane_view"].format(l=planes[v["plane"]]["label"]), planes[v["plane"]].get("color")
@@ -1454,16 +2671,28 @@ def run(SPEC, OUT, progress=None):
                 P.text(cx, ty0 - 3, TX["iso"] if persp else TX["scale_of"].format(s=planlayout.label(scale)), 2.5, "center", grey=True)
             if not persp:
                 P.layer = "DIMENSIONS"
-                dims_of(P, v, *real_dims[v["name"]], every or (v["name"], "h") in own, every or (v["name"], "v") in own)
-                yc = v["y"] + v["h"] + D1
+                extra = dims_of(P, v, *real_dims[v["name"]], every or (v["name"], "h") in own, every or (v["name"], "v") in own)
+                if ARCH:
+                    arch_marks(P, v)
+                yc = v["y"] + v["h"] + D1 + extra
+                if HOLES.get("axes", True):
+                    axes_of(P, v, drawn[v["name"]]["ext"])
+                if drawn[v["name"]].get("chamfers"):
+                    chamfers_of(P, v, drawn[v["name"]]["ext"])
+                if drawn[v["name"]].get("circ"):
+                    circ_of(P, v, drawn[v["name"]]["ext"])
+                if drawn[v["name"]].get("hole_dims"):
+                    holes_of(P, v, drawn[v["name"]]["ext"], yc + CHAIN_ROW)
+                    yc += 0 if SPEC.get("hole_table") else CHAIN_ROW
+                hs = drawn[v["name"]].get("chain_hs") or []
                 for ch in drawn[v["name"]].get("chains", []):
-                    yc += CHAIN_ROW
                     if ch["segs"]:
-                        chain_of(P, v, ch, yc, drawn[v["name"]]["ext"])
-                    if ch["pos"]:
-                        yc += POS_ROW
+                        chain_of(P, v, ch, yc + sum(hs[:ch["row"]]) + CHAIN_ROW, drawn[v["name"]]["ext"])
+                yc += sum(hs)
                 if drawn[v["name"]].get("manual"):
                     manual_of(P, v, drawn[v["name"]]["manual"], drawn[v["name"]]["ext"], yc)
+                if drawn[v["name"]].get("angles"):
+                    angle_of(P, v, drawn[v["name"]]["angles"], drawn[v["name"]]["ext"])
                 P.layer = "FRAME"
         tb_w, tb_h = min(planlayout.TB_W, sw - 2 * m), planlayout.TB_H
         tx, ty = sw - m - tb_w, sh - m - tb_h - XT["inside"]
@@ -1490,9 +2719,14 @@ def run(SPEC, OUT, progress=None):
         P.text(X(0) + 1.5, r1 + 2, TX["TITLE"], 1.8, grey=True)
         tt = g["label"] if notitle else f"{title} — {g['label']}" if g["label"] else title
         P.text(X(0) + 1.5, r1 + 8, tt, 5 if text_width(tt) * 5 < tb_w * 0.58 else 3.5 if text_width(tt) * 3.5 < tb_w * 0.58 else 2.5, bold=True)
-        P.text(X(0.61) + 1.5, r1 + 2, TX["PROJECTION"], 1.8, grey=True)
-        angle_symbol(P, X(0.61) + 7.5, r1 + 6.6, third)
-        P.text(X(0.695), r1 + 11.7, TX["third" if third else "first"], 1.8, "center", grey=True)
+        if ARCH:
+            P.text(X(0.61) + 1.5, r1 + 2, TX.get("PHASE", "PHASE"), 1.8, grey=True)
+            ph = str(ARCH.get("phase") or "—")
+            P.text(X(0.695), r1 + 8, ph, max(1.8, min(5, (tb_w * 0.17 - 3) / max(text_width(ph, True), 1e-6))), "center", bold=True)
+        else:
+            P.text(X(0.61) + 1.5, r1 + 2, TX["PROJECTION"], 1.8, grey=True)
+            angle_symbol(P, X(0.61) + 7.5, r1 + 6.6, third)
+            P.text(X(0.695), r1 + 11.7, TX["third" if third else "first"], 1.8, "center", grey=True)
         bw = tb_w * 0.22 - 3
         if logo:
             P.image(X(0.78) + 1.5, r1 + 1, bw, 11 if not brand else 8, logo)
@@ -1562,7 +2796,8 @@ def run(SPEC, OUT, progress=None):
                     P.text(X(cols[c]) + 1.5, yy + 3.1, t, sz, grey=not i, bold=bool(i) and c == 0)
             yb = top - 4
         if g["bom"] and g["annex"]:
-            na = next(i for i, (gg, p) in enumerate(jobs, 1) if gg is g and p.get("annex"))
+            owner = g.get("annex_of") or g
+            na = next(i for i, (gg, p) in enumerate(jobs, 1) if gg is owner and p.get("annex"))
             P.text(tx, yb - 2.5, TX["annex_see"].format(n=na), 2.5, bold=True)
             yb -= 7
         elif g["bom"]:
@@ -1600,6 +2835,22 @@ def run(SPEC, OUT, progress=None):
                     sz = 1.8 if not i else max(1.2, min(2.5, room / max(text_width(tt), 1e-6)))
                     P.text(X(cols[c]) + 1.5, yy + 3.1, tt, sz, grey=not i, bold=bool(i) and c == 0)
             yb = top - 5
+        if XT.get("holes") and HOLE_ROWS:
+            top = yb - (len(HOLE_ROWS) + 1) * REV_ROW
+            P.text(tx, top - 2, "TABLEAU DES TROUS — ORIGINE : COIN BAS GAUCHE DE LA VUE" if lang == "fr" else "HOLE TABLE — ORIGIN: BOTTOM LEFT CORNER OF THE VIEW", 2.5, bold=True)
+            P.poly([(tx, top), (tx + tb_w, top), (tx + tb_w, yb), (tx, yb)], 0.35, closed=True)
+            named = any(len(r) > 4 and r[4] for r in HOLE_ROWS)
+            cols = (0, 0.12, 0.29, 0.46, 1) if named else (0, 0.18, 0.45, 0.72, 1)
+            for f in cols[1:-1]:
+                P.line(X(f), top, X(f), yb, 0.2)
+            head = ("REP." if lang == "fr" else "TAG", "X", "Y", ("TROU" if lang == "fr" else "HOLE") if named else "Ø")
+            for i, r in enumerate([head] + [(t, fmt(x), fmt(y), (rest[0] if rest and rest[0] else "Ø" + fmt(d))) for t, x, y, d, *rest in HOLE_ROWS]):
+                yy = top + i * REV_ROW
+                if i:
+                    P.line(tx, yy, tx + tb_w, yy, 0.2)
+                for c, tt in enumerate(r):
+                    P.text(X(cols[c]) + 1.5, yy + 3.1, tt, 1.8 if not i else 2.5, grey=not i, bold=bool(i) and c == 0)
+            yb = top - 5
         if XT["tol"]:
             vals = ISO2768[XT["tol"]]
             used = [i for i, (lo, hi) in enumerate(ISO2768_RANGES) if vals[i] is not None and any(lo <= x <= hi for x in DIMV)]
@@ -1627,7 +2878,9 @@ def run(SPEC, OUT, progress=None):
             P.text(tx, top + 2.5, TX["REMARKS"], 2.5, bold=True)
             for i, t in enumerate(XT["rem"]):
                 P.text(tx, top + 5 + (i + 0.75) * REM_LINE, t, REM_SIZE)
-        if not plain:
+        if ARCH:
+            P.text(tx, ty - 5.5, TX.get("arch_note", "{u}").format(u=UNITS[unit][1], z=ARCH.get("ngf") or "—"), 1.8, grey=True)
+        elif not plain:
             P.text(tx, ty - 8.5, TX["dims"].format(u=UNITS[unit][1] + (f" [{UNITS[unit2][1]}]" if unit2 else ""), a=dual(real.x), b=dual(real.y), c=dual(real.z)), 1.8, grey=True)
             wlo, whi = lo * unit_mm, hi * unit_mm
             P.text(tx, ty - 5.5, TX["origin"] + " · ".join(TX["range"].format(a=a, lo=fmt(wlo[i] + 0, 1 if unit == "mm" else None), hi=fmt(whi[i] + 0, 1 if unit == "mm" else None)) for i, a in enumerate("XYZ")), 1.8, grey=True)
@@ -1640,11 +2893,17 @@ def run(SPEC, OUT, progress=None):
     os.makedirs(os.path.join(OUT, "out"), exist_ok=True)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", SPEC.get("name") or "plan").strip(" .") or "plan"
     svgs = [f"{name}.svg"] if len(sheets) == 1 else [f"{name}-{i}.svg" for i in range(1, len(sheets) + 1)]
+    pal = {k: v for k, v in (SPEC.get("layer_colors") or {}).items() if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v)}
+    for P in sheets:
+        P.palette, P.pdf_palette = pal or None, bool(SPEC.get("pdf_colors")) and bool(SPEC.get("svg_colors"))
     for fn, P in zip(svgs, sheets):
         with open(os.path.join(OUT, "out", fn), "w", encoding="utf-8") as f:
-            f.write(P.svg())
+            f.write(P.svg(bool(SPEC.get("svg_colors"))))
     with open(os.path.join(OUT, "out", f"{name}.pdf"), "wb") as f:
-        f.write(pdf(sheets))
+        f.write(pdf(sheets, {"title": f"{SPEC.get('name') or 'plan'} — {SPEC.get('title') or ''}".strip(" —"), "author": SPEC.get("author") or "",
+                             "subject": SPEC.get("project") or "", "keywords": f"rev. {SPEC.get('rev') or 'A'}",
+                             "marks": [f"{TX['SHEET'].capitalize()} {i}/{len(sheets)}" + (f" — {g['label']}" if g.get("label") else "")
+                                       for i, (g, _pg) in enumerate(jobs, 1)]}))
     files = [f"{name}.pdf"] + svgs
     for write in EXTRA_OUTPUTS:
         files += write(sheets, os.path.join(OUT, "out"), name)

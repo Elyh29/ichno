@@ -2,6 +2,45 @@
 
 All notable changes to Ichno. Each version ships when it is ready.
 
+## 1.0.7 — 2026-11-12
+
+### Annotations
+- Manual dimensions between 2 vertices (Edit Mode), drawn at true length on the views parallel to them; order adjustable in the list
+- Angle dimensions from 3 vertices: dimension arc centred on the vertex, value in degrees (ISO 129-1)
+- Symbols before the value of manual dimensions: Ø, R, SØ, SR, □, t= (ISO 129-1)
+- Hole dimensions: on the view showing the most holes, "4 × Ø8" per diameter on a leader, spacing as chain dimensions; exact values taken from the model
+- Centre lines on holes and shafts (ISO 128-2), found automatically from circular edges
+- 45° chamfers found on the model and dimensioned "2 × 45°" (ISO 129-1)
+- Overall size without handles: body width, depth and height first, full size in brackets, e.g. 45.0 then (47.2); handles found by name or in a "Hors encombrement" collection
+- Marked edges: edges you choose are always drawn, even on smooth surfaces (seams, joints, folds); Mark / Clear / Select in Edit Mode
+- Edge condition (ISO 13715), e.g. "−0.3", in the title block
+
+
+### Viewer and output
+- Viewer inside Blender (button next to Make Plan): the last drawing sheet by sheet in an "Ichno" workspace, thumbnails, layers on/off, Fit / Paper size, Draft / Normal / High quality, save a sheet as PNG, back to your workspace; reloads after each drawing
+- Output: one checkbox per file (PDF, SVG); "When done": open the PDF, show it in the viewer, or nothing
+- Layer colours (one per layer) in the SVG and the viewer, optional in the PDF
+- SVG: one group per layer (Inkscape layers, named groups in Illustrator and Affinity), same drawing order as the PDF
+- PDF: title, author, project and revision in the document properties; one bookmark per sheet
+- Sheets per collection: two sheets with the same bill of materials share one annex sheet
+- Panel reorganised in working order, two levels at most; closed headers say what is on
+
+
+### Works with Talos (fasteners)
+- Screws, nuts and washers drawn from their description in front, side and top views; in sections they stay whole (ISO), hatching stops at their outline
+- Holes dimensioned in full (ISO 129-1): "4 × Ø6.6 ⌴ Ø11 ↧ 6.4", "Ø5.5 ⌵ Ø11.6 × 90°", "M5 ↧ 8", inserts, blind hole depth; ⌴ ⌵ ↧ drawn in the PDF and written in the SVG
+- Threads (ISO 6410-1): three-quarter circles at the nominal diameter seen end-on, thread root seen from the side, hidden tapped holes dashed
+- Bill of materials: full designations in the drawing's language ("ISO 4762 M6 × 20 – 10.9 screw", nuts, washers, inserts, pins)
+
+
+### Fixes
+- Hidden lines: overlapping pieces of an edge joined before dashing (no more solid hidden lines), small isolated bits removed, no stray triangles or hatching behind touching parts
+- Stacked holes: grouped by distance and dimensioned once, with the hole you actually see
+- Section caps hide without drawing (no more diagonal lines across a section); hidden lines joined into regular dashes
+- Chain dimensions that don't overlap share one row; the reference is named after the model side (Front (-Y), Back (+Y), Left (-X)…)
+- A drawing started in Edit Mode is no longer empty; a view with no line is re-evaluated, with a warning if it stays empty
+- Untitled drawing: no more two lone dashes at the top of the sheet
+
 ## 1.0.6 — 2026-11-08
 
 ### Section views

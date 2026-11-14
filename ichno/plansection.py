@@ -34,7 +34,8 @@ def parse(specs, views, vmap, lo, hi, ctr, colored, warnings, TX):
         if not min(dl) < depth < max(dl):
             warnings.append(TX["sec_out"].format(l=lab))
         col = (tuple(sx["color"])[:3] if sx.get("color") else SEC_COLORS[len(secs) % len(SEC_COLORS)]) if colored else None
-        secs[nm] = {"label": lab, "p0": ctr + sd * (depth - ctr.dot(sd)), "d": sd, "hatch": min(max(float(sx.get("hatch") or 3), 0.7), 10), "color": col}
+        secs[nm] = {"label": lab, "p0": ctr + sd * (depth - ctr.dot(sd)), "d": sd, "hatch": min(max(float(sx.get("hatch") or 3), 0.7), 10), "color": col,
+                   "solid": "auto" if sx.get("solid") == "auto" else bool(sx.get("solid")), "title": str(sx.get("title") or "")[:60], "noline": bool(sx.get("noline")), "on_plan": bool(sx.get("on_plan")), "over": float(sx.get("over") or 0)}
     return secs
 
 
@@ -49,10 +50,14 @@ def edge_lines(secs, sec_lines, name, d, inv, ext):
 
 def assign_cutlines(secs, sec_lines, drawn, side, warnings, TX):
     for nm, sx in secs.items():
+        if sx.get("noline"):
+            continue
         pref = {"Face": ("Dessus", side), side: ("Face", "Dessus"), "Dessus": ("Face", side)}[nm]
+        if sx.get("on_plan") and nm != "Dessus":
+            pref = ("Dessus",) + pref
         best = next((n for n in pref if n in sec_lines.get(nm, {})), None)
         if best:
-            drawn[best]["cutlines"].append(sec_lines[nm][best])
+            drawn[best]["cutlines"].append(dict(sec_lines[nm][best], over=sx.get("over")) if sx.get("over") else sec_lines[nm][best])
         else:
             warnings.append(TX["sec_noline"].format(l=sx["label"]))
 
@@ -84,7 +89,7 @@ def chain_loops(edges):
     return loops, closed
 
 
-def section_cut(objs, p0, d):
+def section_cut(objs, p0, d, keep_fasteners=False):
     import bmesh
     dg = bpy.context.evaluated_depsgraph_get()
     sc, vl = bpy.context.scene, bpy.context.view_layer
@@ -94,6 +99,8 @@ def section_cut(objs, p0, d):
         ds = [(ev.matrix_world @ Vector(c) - p0).dot(d) for c in ev.bound_box]
         eps = 1e-6 * max(ev.dimensions.length, 1e-3)
         if min(ds) >= -eps:
+            continue
+        if keep_fasteners and (o.get("fastener") is not None or o.get("fastener_part")) and o.get("draw") is not None and max(ds) > eps:
             continue
         hide.append(o)
         if max(ds) <= eps:
@@ -115,18 +122,43 @@ def section_cut(objs, p0, d):
         if cut and not closed:
             opened.append(o)
         elif loops:
-            cuts.append((i, [[tuple(v.co) for v in lp] for lp in loops]))
-            caps = bmesh.ops.triangle_fill(bm, use_beauty=True, use_dissolve=True, edges=cut, normal=-d)
+            if not (o.get("fastener") is not None or o.get("fastener_part")):
+                cuts.append((i, [[tuple(v.co) for v in lp] for lp in loops]))
+            cb = bmesh.new()
+            vmap = {}
+            for e in cut:
+                for v in e.verts:
+                    if v not in vmap:
+                        vmap[v] = cb.verts.new(v.co)
+            cedges = [cb.edges.new((vmap[e.verts[0]], vmap[e.verts[1]])) for e in cut]
+            caps = bmesh.ops.triangle_fill(cb, use_beauty=True, use_dissolve=True, edges=cedges, normal=-d)
             for f in caps["geom"]:
                 if isinstance(f, bmesh.types.BMFace) and f.is_valid:
                     f.normal_update()
                     if f.normal.dot(d) > 0:
                         f.normal_flip()
+            cmesh = bpy.data.meshes.new(o.name + " bouchon")
+            cb.to_mesh(cmesh)
+            cb.free()
+            cap = bpy.data.objects.new(o.name + " bouchon", cmesh)
+            sc.collection.objects.link(cap)
+            try:
+                cap.lineart.usage = "OCCLUSION_ONLY"
+            except (TypeError, AttributeError):
+                pass
+            copies.append(cap)
         mesh = bpy.data.meshes.new(o.name + " coupe")
         bm.to_mesh(mesh)
         bm.free()
         ob = bpy.data.objects.new(o.name + " coupe", mesh)
         sc.collection.objects.link(ob)
+        if o.get("fastener") is not None or o.get("fastener_part"):
+            try:
+                ob.lineart.usage = "NO_INTERSECTION"
+                ob.lineart.use_crease_override = True
+                ob.lineart.crease_threshold = math.radians(180 - 70)
+            except (TypeError, AttributeError):
+                pass
         copies.append(ob)
     for o in hide:
         o.hide_render = o.hide_viewport = True
@@ -250,12 +282,79 @@ def arrow_letter(P, sx, sy, tx, ty, ux, uy, label, lw, size):
     P.text(tx + ux * (size * 0.9), ty + uy * (size * 0.9), label, size, "center", bold=True)
 
 
-def draw_hatch(P, paper, step0, col, thin, thick):
+PATTERNS = ("concrete", "masonry", "insulation", "wood", "plaster")
+
+
+def zigzag(lps, step):
+    best = max(((lp[j - 1], lp[j]) for lp in lps for j in range(len(lp))), key=lambda e: math.dist(*e))
+    (x1, y1), (x2, y2) = best
+    L = math.dist((x1, y1), (x2, y2)) or 1
+    ux, uy = (x2 - x1) / L, (y2 - y1) / L
+    nx, ny = -uy, ux
+    pts = [p for lp in lps for p in lp]
+    us = [(x - x1) * ux + (y - y1) * uy for x, y in pts]
+    vs = [(x - x1) * nx + (y - y1) * ny for x, y in pts]
+    v0, v1 = min(vs), max(vs)
+    t = v1 - v0
+    if t < 0.3:
+        return []
+    per = max(t, step)
+    out, u, k = [], min(us), 0
+    while u < max(us):
+        a = (u, v0 + 0.1 * t) if k % 2 == 0 else (u, v1 - 0.1 * t)
+        b = (u + per / 2, v1 - 0.1 * t) if k % 2 == 0 else (u + per / 2, v0 + 0.1 * t)
+        out.append(tuple((x1 + q[0] * ux + q[1] * nx, y1 + q[0] * uy + q[1] * ny) for q in (a, b)))
+        u += per / 2
+        k += 1
+    return [(a, b) for a, b in out if inside(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2), lps)]
+
+
+def inside(pt, lps):
+    x, y, c = pt[0], pt[1], False
+    for lp in lps:
+        for j in range(len(lp)):
+            (x1, y1), (x2, y2) = lp[j - 1], lp[j]
+            if (y1 <= y) != (y2 <= y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                c = not c
+    return c
+
+
+def pattern_lines(lps, pat, step):
+    if pat == "concrete":
+        return hatch_lines(lps, math.radians(45), step * 1.6) + hatch_lines(lps, math.radians(-45), step * 1.6)
+    if pat == "masonry":
+        return hatch_lines(lps, math.radians(45), step * 0.6)
+    if pat == "insulation":
+        return zigzag(lps, step)
+    if pat == "wood":
+        (x1, y1), (x2, y2) = max(((lp[j - 1], lp[j]) for lp in lps for j in range(len(lp))), key=lambda e: math.dist(*e))
+        return hatch_lines(lps, -math.atan2(y2 - y1, x2 - x1), step * 0.5)
+    if pat == "plaster":
+        return hatch_lines(lps, math.radians(45), step * 2.2)
+    return None
+
+
+def draw_hatch(P, paper, step0, col, thin, thick, solid=False, pats=None):
+    if solid:
+        P.layer = "HATCH"
+        for i, lps in paper:
+            P.fill(lps, col or (0.2, 0.2, 0.2), 1.0)
+        P.layer = "VISIBLE"
+        for i, lps in paper:
+            for lp in lps:
+                P.poly(lp, thick, closed=True)
+        return
     if col:
         for i, lps in paper:
             P.fill(lps, col, 0.16)
     P.layer = "HATCH"
     for i, lps in paper:
+        mat = (pats or {}).get(i)
+        lines = pattern_lines(lps, mat, step0) if mat in PATTERNS else None
+        if lines is not None:
+            for a, b in lines:
+                P.line(a[0], a[1], b[0], b[1], thin)
+            continue
         step = max(0.7, min(step0, math.sqrt(max(loop_area(lp) for lp in lps)) / 5)) * (1, 0.7, 1.4)[i // 2 % 3]
         for a, b in hatch_lines(lps, math.radians(-45 if i % 2 == 0 else 45), step):
             P.line(a[0], a[1], b[0], b[1], thin)
@@ -270,7 +369,8 @@ def draw_cutline(P, pt, cl, thin, thick, size):
     (ax, ay), (bx, by) = pt(*cl["a"]), pt(*cl["b"])
     n = math.hypot(bx - ax, by - ay) or 1
     ex_, ey = (bx - ax) / n, (by - ay) / n
-    ax, ay, bx, by, n = ax - ex_ * 5, ay - ey * 5, bx + ex_ * 5, by + ey * 5, n + 10
+    o = float(cl.get("over") or 5)
+    ax, ay, bx, by, n = ax - ex_ * o, ay - ey * o, bx + ex_ * o, by + ey * o, n + 2 * o
     dashdot(P, ax, ay, ex_, ey, 6.0, n - 6, thin)
     P.line(ax, ay, ax + ex_ * 6, ay + ey * 6, thick)
     P.line(ax + ex_ * (n - 6), ay + ey * (n - 6), ax + ex_ * n, ay + ey * n, thick)
